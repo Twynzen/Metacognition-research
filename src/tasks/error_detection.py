@@ -10,7 +10,7 @@ WITHOUT being told that errors may exist.
 Aggregate: Balanced accuracy, F1, per-error-type breakdown
 """
 from src.schemas import ErrorReview
-from src.utils import check_answer
+from src.utils import check_answer, validate_bool
 
 
 def error_detection(llm, problem: str, presented_solution: str,
@@ -23,25 +23,30 @@ def error_detection(llm, problem: str, presented_solution: str,
     Returns:
         float: 1.0 for correct classification, 0.0 for wrong.
     """
-    response = llm.prompt(
-        f"""Here is a problem and a proposed solution. Please review the solution carefully and determine if it is correct.
+    try:
+        response = llm.prompt(
+            f"""Here is a problem and a proposed solution. Please review this solution and explain your assessment of it.
 
 Problem: {problem}
 
 Proposed Solution: {presented_solution}
 
-Is this solution correct? If not, explain the error and provide the correct answer.""",
-        schema=ErrorReview
-    )
+Provide your assessment. If you find any issues, explain them and provide the correct answer.""",
+            schema=ErrorReview
+        )
 
-    has_error = solution_has_error.lower() == "true"
+        has_error = solution_has_error.lower() == "true"
+        model_detected_error = validate_bool(response.has_error)
 
-    if has_error and response.has_error:
-        return 1.0  # True positive: correctly detected error
-    elif not has_error and not response.has_error:
-        return 1.0  # True negative: correctly identified correct solution
-    else:
-        return 0.0  # Misclassification
+        if has_error and model_detected_error:
+            return 1.0  # True positive: correctly detected error
+        elif not has_error and not model_detected_error:
+            return 1.0  # True negative: correctly identified correct solution
+        else:
+            return 0.0  # Misclassification
+    except Exception as e:
+        print(f"[WARN] error_detection failed: {e}")
+        return 0.0
 
 
 def error_detection_inner(llm, problem: str, presented_solution: str,

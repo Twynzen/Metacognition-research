@@ -11,7 +11,7 @@ Delayed JOLs are more accurate than immediate JOLs (Nelson & Dunlosky, 1991).
 Aggregate: Gamma correlation, AUROC2
 """
 from src.schemas import FOKResponse
-from src.utils import check_answer
+from src.utils import check_answer, validate_confidence
 
 
 def feeling_of_knowing(llm, question: str, correct_answer: str,
@@ -25,21 +25,25 @@ def feeling_of_knowing(llm, question: str, correct_answer: str,
         float: Per-item FOK accuracy in [0, 1].
                1.0 = prediction perfectly matches correctness.
     """
-    fok_response = llm.prompt(
-        f"""I'm going to ask you a question. Before you answer, predict how likely you are to get it correct on a scale of 0-100.
+    try:
+        fok_response = llm.prompt(
+            f"""I'm going to ask you a question. Before you answer, predict how likely you are to get it correct on a scale of 0-100.
 
 Then provide your best answer.
 
 Question: {question}""",
-        schema=FOKResponse
-    )
+            schema=FOKResponse
+        )
 
-    is_correct = check_answer(fok_response.answer, correct_answer)
-    prediction = max(0, min(100, fok_response.prediction)) / 100.0
-    correctness = 1.0 if is_correct else 0.0
+        is_correct = check_answer(fok_response.answer, correct_answer)
+        prediction = validate_confidence(fok_response.prediction) / 100.0
+        correctness = 1.0 if is_correct else 0.0
 
-    fok_error = abs(prediction - correctness)
-    return round(1.0 - fok_error, 4)
+        fok_error = abs(prediction - correctness)
+        return round(1.0 - fok_error, 4)
+    except Exception as e:
+        print(f"[WARN] feeling_of_knowing failed: {e}")
+        return 0.0
 
 
 def feeling_of_knowing_inner(llm, question: str, correct_answer: str) -> float:

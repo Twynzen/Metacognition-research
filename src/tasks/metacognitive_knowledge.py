@@ -39,13 +39,18 @@ def metacognitive_knowledge(llm, domain: str, domain_questions: str,
     questions = domain_questions.split("|||")
     answers = domain_answers.split("|||")
     correct_count = 0
+    answered = 0
 
     for q, a in zip(questions, answers):
-        resp = llm.prompt(f"Answer briefly: {q}")
-        if check_answer(str(resp), a):
-            correct_count += 1
+        try:
+            resp = str(llm.prompt(f"Answer in 1-5 words ONLY. No explanation needed.\n\n{q}")).strip()
+            answered += 1
+            if check_answer(resp, a):
+                correct_count += 1
+        except Exception:
+            continue
 
-    actual_accuracy = correct_count / len(questions)
+    actual_accuracy = correct_count / max(answered, 1)
     predicted = max(0, min(100, prediction.predicted_accuracy)) / 100.0
 
     error = abs(predicted - actual_accuracy)

@@ -129,3 +129,71 @@ def compute_brier_decomposition(confidences, outcomes, n_bins=10):
         "resolution": round(resolution, 4),
         "uncertainty": round(uncertainty, 4),
     }
+
+
+def conditional_ece(confidences, correctness, conditions, n_bins=10):
+    """
+    INNOV-001: ECE conditioned on a categorical variable (e.g., difficulty).
+
+    Measures calibration separately per condition level. A model may be well
+    calibrated on easy questions but poorly calibrated on hard ones — the
+    "hard-easy effect" from Lichtenstein & Fischhoff (1977).
+
+    Args:
+        confidences: array-like of float in [0, 1]
+        correctness: array-like of int/float in {0, 1}
+        conditions: array-like of str (e.g., ['easy', 'medium', 'hard'])
+        n_bins: bins for each sub-ECE
+
+    Returns:
+        dict of {condition_level: ece_value}
+    """
+    conf = np.array(confidences, dtype=float)
+    corr = np.array(correctness, dtype=float)
+    conds = np.array(conditions)
+
+    results = {}
+    for level in np.unique(conds):
+        mask = conds == level
+        if mask.sum() >= 20:  # minimum for stable ECE
+            sub_ece = compute_ece(conf[mask], corr[mask], n_bins=n_bins)
+            results[str(level)] = sub_ece["ece"]
+    return results
+
+
+def overconfidence_analysis(confidences, correctness):
+    """
+    METRIC-002: Decompose miscalibration into overconfidence vs underconfidence.
+
+    Provides insight into whether the model tends to be too confident when
+    wrong (overconfident) or too cautious when right (underconfident).
+
+    Args:
+        confidences: array-like of float in [0, 1]
+        correctness: array-like of int/float in {0, 1}
+
+    Returns:
+        dict with overconfidence_rate, underconfidence_rate, confidence_gap
+    """
+    conf = np.array(confidences, dtype=float)
+    corr = np.array(correctness, dtype=float)
+
+    # Overconfident: high confidence but wrong
+    overconf_mask = (conf > 0.7) & (corr == 0)
+    overconf_rate = float(overconf_mask.mean())
+
+    # Underconfident: low confidence but right
+    underconf_mask = (conf < 0.3) & (corr == 1)
+    underconf_rate = float(underconf_mask.mean())
+
+    # Mean confidence when correct vs incorrect
+    mean_conf_correct = float(conf[corr == 1].mean()) if (corr == 1).any() else 0.0
+    mean_conf_incorrect = float(conf[corr == 0].mean()) if (corr == 0).any() else 0.0
+
+    return {
+        "overconfidence_rate": round(overconf_rate, 4),
+        "underconfidence_rate": round(underconf_rate, 4),
+        "mean_conf_when_correct": round(mean_conf_correct, 4),
+        "mean_conf_when_incorrect": round(mean_conf_incorrect, 4),
+        "confidence_gap": round(mean_conf_correct - mean_conf_incorrect, 4),
+    }

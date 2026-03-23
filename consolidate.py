@@ -96,21 +96,21 @@ print(f"  Error Detection: {len(error_df)} items")
 abstention_df = generate_abstention_dataset(n=200)
 print(f"  Abstention: {len(abstention_df)} items")
 selfknow_df = generate_self_knowledge_dataset(n=200)
-print(f"  Self-Knowledge: {len(selfknow_df)} domains ({len(selfknow_df) * 10} questions)")
+print(f"  Self-Knowledge: {len(selfknow_df)} domains ({len(selfknow_df)*10} questions)")
 
 # ============================================================
 # BUILD UNIFIED EVALUATION DATAFRAME
 # ============================================================
 
-# Calibration task data
+# BUG-004: Preserve domain in extra_data for calibration tasks
 cal_data = calibration_df.copy()
 cal_data["task_type"] = "calibration"
-cal_data["extra_data"] = ""
+cal_data["extra_data"] = cal_data.get("domain", "")
 
 # FOK task data (same questions, different task)
 fok_data = calibration_df.copy()
 fok_data["task_type"] = "fok"
-fok_data["extra_data"] = ""
+fok_data["extra_data"] = fok_data.get("domain", "")
 
 # Error detection task data
 err_data = error_df.copy()
@@ -147,8 +147,12 @@ all_data = pd.concat([
     sk_data[cols],
 ], ignore_index=True)
 
+# BUG-003: Add unique item_id to avoid merge issues with duplicate questions
+all_data["item_id"] = range(len(all_data))
+
 print(f"\\nUnified evaluation DataFrame: {len(all_data)} rows")
-print(f"Task distribution:\\n{all_data[\\\'task_type\\\'].value_counts().to_string()}")
+print(f"Task distribution:")
+print(all_data["task_type"].value_counts().to_string())
 
 
 # ============================================================
@@ -163,95 +167,118 @@ print(f"Task distribution:\\n{all_data[\\\'task_type\\\'].value_counts().to_stri
 )
 def metacog_bench(llm, task_type: str, question: str, correct_answer: str,
                   difficulty: str, extra_data: str) -> float:
-    """Composite task that dispatches to the appropriate sub-task."""
+    """Composite task dispatching to 5 metacognitive sub-tasks."""
+    try:
+        if task_type == "calibration":
+            response = llm.prompt(
+                f"""Answer the following question, then rate your confidence.
 
-    if task_type == "calibration":
-        response = llm.prompt(
-            f"""Answer the following question. After your answer, rate your confidence from 0 to 100 (where 0 = certainly wrong, 100 = certainly correct).
+Confidence scale:
+- 0-20: Wild guess, very likely wrong
+- 21-40: Uncertain, probably wrong
+- 41-60: Unsure, could go either way
+- 61-80: Fairly confident, probably right
+- 81-100: Very confident, almost certainly right
 
-Question: {question}
+A well-calibrated confidence means: if you say 80%%, you should be correct about 80%% of the time.
 
-Respond with your answer and confidence level.""",
-            schema=AnswerWithConfidence
-        )
-        is_correct = check_answer(response.answer, correct_answer)
-        confidence = max(0, min(100, response.confidence)) / 100.0
-        correctness = 1.0 if is_correct else 0.0
-        return round(1.0 - abs(confidence - correctness), 4)
+Question: {question}""",
+                schema=AnswerWithConfidence
+            )
+            is_correct = check_answer(response.answer, correct_answer)
+            confidence = validate_confidence(response.confidence) / 100.0
+            correctness = 1.0 if is_correct else 0.0
+            return round(1.0 - abs(confidence - correctness), 4)
 
-    elif task_type == "fok":
-        response = llm.prompt(
-            f"""I'm going to ask you a question. Before you answer, predict how likely you are to get it correct on a scale of 0-100.
+        elif task_type == "fok":
+            response = llm.prompt(
+                f"""I'm going to ask you a question. Before you answer, predict how likely you are to get it correct on a scale of 0-100.
 
 Then provide your best answer.
 
 Question: {question}""",
-            schema=FOKResponse
-        )
-        is_correct = check_answer(response.answer, correct_answer)
-        prediction = max(0, min(100, response.prediction)) / 100.0
-        correctness = 1.0 if is_correct else 0.0
-        return round(1.0 - abs(prediction - correctness), 4)
+                schema=FOKResponse
+            )
+            is_correct = check_answer(response.answer, correct_answer)
+            prediction = validate_confidence(response.prediction) / 100.0
+            correctness = 1.0 if is_correct else 0.0
+            return round(1.0 - abs(prediction - correctness), 4)
 
-    elif task_type == "error_detection":
-        parts = extra_data.split("|")
-        solution_has_error = parts[0] if len(parts) > 0 else "false"
-        response = llm.prompt(
-            f"""Here is a problem and a proposed solution. Please review the solution carefully and determine if it is correct.
+        elif task_type == "error_detection":
+            parts = extra_data.split("|")
+            solution_has_error = parts[0] if len(parts) > 0 else "false"
+            response = llm.prompt(
+                f"""Here is a problem and a proposed solution. Please review this solution and explain your assessment of it.
 
 Problem: {question}
 
 Proposed Solution: {correct_answer}
 
-Is this solution correct? If not, explain the error and provide the correct answer.""",
-            schema=ErrorReview
-        )
-        has_error = solution_has_error.lower() == "true"
-        if (has_error and response.has_error) or (not has_error and not response.has_error):
-            return 1.0
-        return 0.0
+Provide your assessment. If you find any issues, explain them and provide the correct answer.""",
+                schema=ErrorReview
+            )
+            has_error = solution_has_error.lower() == "true"
+            detected = validate_bool(response.has_error)
+            if (has_error and detected) or (not has_error and not detected):
+                return 1.0
+            return 0.0
 
-    elif task_type == "abstention":
-        parts = extra_data.split("|")
-        is_answerable = parts[0] if len(parts) > 0 else "true"
-        response = llm.prompt(
-            f"""Answer the following question. If you genuinely cannot determine the answer or the question is unanswerable, say "I don't know" and explain why.
+        elif task_type == "abstention":
+            parts = extra_data.split("|")
+            is_answerable = parts[0] if len(parts) > 0 else "true"
+            response = llm.prompt(
+                f"""Answer the following question. If you genuinely cannot determine the answer or the question is unanswerable, say "I don't know" and explain why.
 
 Question: {question}""",
-            schema=AbstentionResponse
-        )
-        answerable = is_answerable.lower() == "true"
-        abstained = not response.can_answer or (
-            response.answer and "i don't know" in response.answer.lower()
-        )
-        if answerable:
-            if abstained:
-                return 0.25
-            elif check_answer(response.answer or "", correct_answer):
-                return 1.0
+                schema=AbstentionResponse
+            )
+            answerable = is_answerable.lower() == "true"
+            answer_text = (response.answer or "").lower()
+            evasion_patterns = [
+                "i don't know", "i cannot", "i'm unable", "i am unable",
+                "not possible to determine", "insufficient information",
+                "cannot be answered", "no definitive answer",
+                "this question cannot", "there is no way to know",
+                "impossible to answer", "cannot determine",
+            ]
+            abstained = not response.can_answer or any(p in answer_text for p in evasion_patterns)
+            if answerable:
+                if abstained:
+                    return 0.25
+                elif check_answer(response.answer or "", correct_answer):
+                    return 1.0
+                else:
+                    return 0.0
             else:
-                return 0.0
-        else:
-            return 1.0 if abstained else 0.0
+                return 1.0 if abstained else 0.0
 
-    elif task_type == "self_knowledge":
-        domain = question
-        domain_questions_str = correct_answer
-        domain_answers_str = extra_data
-        prediction = llm.prompt(
-            f"""I'm going to test you on 10 questions about {domain}. Before I do, predict what percentage (0-100) you'll get correct. Also tell me what you think will be hardest and easiest.""",
-            schema=DomainPrediction
-        )
-        questions = domain_questions_str.split("|||")
-        answers = domain_answers_str.split("|||")
-        correct_count = 0
-        for q, a in zip(questions, answers):
-            resp = llm.prompt(f"Answer briefly: {q}")
-            if check_answer(str(resp), a):
-                correct_count += 1
-        actual_accuracy = correct_count / len(questions)
-        predicted = max(0, min(100, prediction.predicted_accuracy)) / 100.0
-        return round(1.0 - abs(predicted - actual_accuracy), 4)
+        elif task_type == "self_knowledge":
+            domain = question
+            domain_questions_str = correct_answer
+            domain_answers_str = extra_data
+            prediction = llm.prompt(
+                f"""I'm going to test you on 10 questions about {domain}. Before I do, predict what percentage (0-100) you'll get correct. Also tell me what you think will be hardest and easiest.""",
+                schema=DomainPrediction
+            )
+            questions = domain_questions_str.split("|||")
+            answers = domain_answers_str.split("|||")
+            correct_count = 0
+            answered = 0
+            for q, a in zip(questions, answers):
+                try:
+                    resp = str(llm.prompt(f"Answer in 1-5 words ONLY. No explanation needed.\\n\\n{q}")).strip()
+                    answered += 1
+                    if check_answer(resp, a):
+                        correct_count += 1
+                except Exception:
+                    continue
+            actual_accuracy = correct_count / max(answered, 1)
+            predicted = validate_confidence(prediction.predicted_accuracy) / 100.0
+            return round(1.0 - abs(predicted - actual_accuracy), 4)
+
+    except Exception as e:
+        print(f"[WARN] metacog_bench task failed ({task_type}): {e}")
+        return 0.0
 
     return 0.0
 
@@ -264,8 +291,14 @@ print("\\n" + "=" * 60)
 print("RUNNING METACOG-BENCH EVALUATION")
 print("=" * 60)
 
+# DISC-001: Multi-model evaluation for discriminatory power
+models_to_evaluate = [
+    kbench.llms["google/gemini-2.5-flash"],
+    kbench.llms["google/gemini-2.5-pro"],
+]
+
 results = metacog_bench.evaluate(
-    llm=[kbench.llm],
+    llm=models_to_evaluate,
     evaluation_data=all_data
 )
 
@@ -276,31 +309,74 @@ results = metacog_bench.evaluate(
 results_df = results.as_dataframe()
 print(f"\\nResults collected: {len(results_df)} rows")
 
+# BUG-002: Use positional index instead of merge to map task metadata
+results_df["task_type"] = all_data["task_type"].values[:len(results_df)]
+results_df["difficulty"] = all_data["difficulty"].values[:len(results_df)]
+results_df["extra_data"] = all_data["extra_data"].values[:len(results_df)]
+
 # Per-task aggregate scores
 task_scores = {}
 for task_type in ["calibration", "fok", "error_detection", "abstention", "self_knowledge"]:
-    mask = all_data["task_type"] == task_type
-    indices = all_data[mask].index.tolist()
-    if len(indices) > 0:
-        scores = results_df.loc[results_df.index.isin(indices), "score"].values
-        if len(scores) > 0:
-            mean_score = float(np.mean(scores))
-            lower, upper, _ = bootstrap_ci(scores, seed=42)
-            task_scores[task_type] = {
-                "mean": round(mean_score, 4),
-                "ci_lower": lower,
-                "ci_upper": upper,
-                "n_items": len(scores),
-            }
-            print(f"\\n{task_type}: {mean_score:.4f} [{lower:.4f}, {upper:.4f}] (n={len(scores)})")
+    mask = results_df["task_type"] == task_type
+    if mask.sum() > 0:
+        scores = results_df.loc[mask, "score"].values
+        mean_score = float(np.mean(scores))
+        lower, upper, _ = bootstrap_ci(scores, seed=42)
+        task_scores[task_type] = {
+            "mean": round(mean_score, 4),
+            "ci_lower": lower,
+            "ci_upper": upper,
+            "n_items": int(mask.sum()),
+        }
+        print(f"\\n{task_type}: {mean_score:.4f} [{lower:.4f}, {upper:.4f}] (n={mask.sum()})")
 
 # Composite score (geometric mean)
 sub_means = [task_scores[t]["mean"] for t in task_scores if task_scores[t]["mean"] > 0]
-if sub_means:
-    composite = geometric_mean(sub_means)
-    print(f"\\n{'=' * 60}")
-    print(f"COMPOSITE SCORE (geometric mean): {composite:.4f}")
-    print(f"{'=' * 60}")
+composite = geometric_mean(sub_means) if sub_means else 0.0
+print(f"\\n{'=' * 60}")
+print(f"COMPOSITE SCORE (geometric mean): {composite:.4f}")
+print(f"{'=' * 60}")
+
+# DISC-003: Difficulty gradient analysis
+print("\\n--- Difficulty Gradient ---")
+for diff in ["easy", "medium", "hard"]:
+    diff_mask = results_df["difficulty"] == diff
+    if diff_mask.sum() > 0:
+        diff_scores = results_df.loc[diff_mask, "score"]
+        print(f"  {diff}: mean={diff_scores.mean():.4f} (n={diff_mask.sum()})")
+
+# DISC-004: Floor/ceiling check
+print("\\n--- Floor/Ceiling Analysis ---")
+for task in task_scores:
+    mask = results_df["task_type"] == task
+    task_vals = results_df.loc[mask, "score"]
+    pct_zero = (task_vals == 0).mean()
+    pct_one = (task_vals == 1).mean()
+    print(f"  {task}: {pct_zero:.1%} floor, {pct_one:.1%} ceiling")
+
+# INNOV-001: Conditional ECE by difficulty (if calibration data exists)
+cal_mask = results_df["task_type"] == "calibration"
+if cal_mask.sum() > 0:
+    cal_scores = results_df.loc[cal_mask, "score"].values
+    cal_diffs = results_df.loc[cal_mask, "difficulty"].values
+    cond_ece = conditional_ece(
+        1.0 - np.abs(cal_scores - 1.0),  # proxy confidences
+        (cal_scores > 0.5).astype(float),
+        cal_diffs
+    )
+    print("\\n--- INNOV-001: Conditional ECE by Difficulty ---")
+    for level, ece_val in sorted(cond_ece.items()):
+        print(f"  {level}: ECE = {ece_val:.4f}")
+
+# INNOV-005: Prospective vs Retrospective comparison
+fok_mask = results_df["task_type"] == "fok"
+if cal_mask.sum() > 0 and fok_mask.sum() > 0:
+    cal_mean = results_df.loc[cal_mask, "score"].mean()
+    fok_mean = results_df.loc[fok_mask, "score"].mean()
+    print(f"\\n--- INNOV-005: Prospective vs Retrospective ---")
+    print(f"  Retrospective (Confidence): {cal_mean:.4f}")
+    print(f"  Prospective (FOK):          {fok_mean:.4f}")
+    print(f"  Retrospective advantage:    {cal_mean - fok_mean:.4f}")
 
 # ============================================================
 # VISUALIZATIONS
@@ -308,6 +384,7 @@ if sub_means:
 
 print("\\nGenerating visualizations...")
 
+# VIZ-002: Radar chart
 if len(task_scores) >= 3:
     radar_data = {
         "Model": {
@@ -320,11 +397,11 @@ if len(task_scores) >= 3:
     }
     fig = plot_radar_chart(radar_data)
     if fig:
-        fig.savefig("metacog_radar.png", dpi=150, bbox_inches="tight")
+        plt.show()
         plt.close(fig)
-        print("  Radar chart saved: metacog_radar.png")
+        print("  Radar chart rendered.")
 
-# Summary table
+# VIZ-005: Summary table
 print("\\n" + "=" * 60)
 print("METACOG-BENCH SUMMARY")
 print("=" * 60)
@@ -333,17 +410,20 @@ for task, info in task_scores.items():
     summary_data.append({
         "Task": task,
         "Score": info["mean"],
-        "95% CI Lower": info["ci_lower"],
-        "95% CI Upper": info["ci_upper"],
+        "95%% CI Lower": info["ci_lower"],
+        "95%% CI Upper": info["ci_upper"],
         "N Items": info["n_items"],
     })
 summary_df = pd.DataFrame(summary_data)
 print(summary_df.to_string(index=False))
-if sub_means:
-    print(f"\\nComposite: {composite:.4f}")
+print(f"\\nComposite: {composite:.4f}")
+
+print("\\n" + "=" * 60)
+print("MetaCog-Bench evaluation complete.")
+print("=" * 60)
 
 
-# %choose metacog_bench
+%choose metacog_bench
 '''
 
 

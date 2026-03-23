@@ -231,3 +231,78 @@ def plot_dunning_kruger(domain_predictions, domain_actuals, domain_names):
 
     fig.tight_layout()
     return fig
+
+
+def plot_confidence_distributions(cal_data_per_model):
+    """
+    VIZ-003: Side-by-side histograms of confidence distributions (correct vs incorrect).
+
+    A well-calibrated model shows separated distributions; a poorly calibrated one
+    shows overlap. Visually impactful and easy to understand.
+
+    Args:
+        cal_data_per_model: dict of {model_name: DataFrame with 'confidence', 'correct'}
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    n = len(cal_data_per_model)
+    fig, axes = plt.subplots(1, max(n, 1), figsize=(4 * max(n, 1), 4), sharey=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, (model, data) in zip(axes, cal_data_per_model.items()):
+        correct = data[data["correct"] == 1]["confidence"]
+        incorrect = data[data["correct"] == 0]["confidence"]
+        ax.hist(correct, bins=20, alpha=0.6, label="Correct", color="green", range=(0, 1))
+        ax.hist(incorrect, bins=20, alpha=0.6, label="Incorrect", color="red", range=(0, 1))
+        short_name = model.split("/")[-1] if "/" in model else model
+        ax.set_title(short_name)
+        ax.set_xlabel("Confidence")
+        ax.legend(fontsize=8)
+
+    axes[0].set_ylabel("Count")
+    fig.suptitle("Confidence Distributions: Correct vs Incorrect", fontsize=14)
+    fig.tight_layout()
+    return fig
+
+
+def plot_ece_heatmap(ece_by_condition, row_label="Condition", col_label="Model"):
+    """
+    VIZ-004: ECE heatmap by condition (e.g., difficulty) per model.
+
+    Args:
+        ece_by_condition: dict of {model_name: {condition: ece_value}}
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    models = list(ece_by_condition.keys())
+    all_conditions = sorted(set(
+        c for m_data in ece_by_condition.values() for c in m_data.keys()
+    ))
+
+    data = np.zeros((len(all_conditions), len(models)))
+    for j, model in enumerate(models):
+        for i, cond in enumerate(all_conditions):
+            data[i, j] = ece_by_condition[model].get(cond, float("nan"))
+
+    fig, ax = plt.subplots(figsize=(max(8, 2 * len(models)), max(4, len(all_conditions) * 0.8)))
+    im = ax.imshow(data, cmap="RdYlGn_r", aspect="auto", vmin=0, vmax=0.5)
+
+    short_models = [m.split("/")[-1] if "/" in m else m for m in models]
+    ax.set_xticks(range(len(models)))
+    ax.set_xticklabels(short_models, rotation=45, ha="right")
+    ax.set_yticks(range(len(all_conditions)))
+    ax.set_yticklabels(all_conditions)
+    plt.colorbar(im, label="ECE (lower = better)")
+    ax.set_title(f"Calibration: {row_label} x {col_label}")
+
+    for i in range(len(all_conditions)):
+        for j in range(len(models)):
+            val = data[i, j]
+            if not np.isnan(val):
+                ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=9)
+
+    fig.tight_layout()
+    return fig

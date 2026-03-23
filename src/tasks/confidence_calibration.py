@@ -10,7 +10,7 @@ Per-item score: 1 - |confidence/100 - correctness|
 Aggregate: ECE (10 bins), Brier Score, AUROC2
 """
 from src.schemas import AnswerWithConfidence
-from src.utils import check_answer
+from src.utils import check_answer, validate_confidence
 
 
 def confidence_calibration(llm, question: str, correct_answer: str,
@@ -25,21 +25,32 @@ def confidence_calibration(llm, question: str, correct_answer: str,
         float: Per-item calibration score in [0, 1].
                1.0 = confidence perfectly matches correctness.
     """
-    response = llm.prompt(
-        f"""Answer the following question. After your answer, rate your confidence from 0 to 100 (where 0 = certainly wrong, 100 = certainly correct).
+    try:
+        response = llm.prompt(
+            f"""Answer the following question, then rate your confidence.
 
-Question: {question}
+Confidence scale:
+- 0-20: Wild guess, very likely wrong
+- 21-40: Uncertain, probably wrong
+- 41-60: Unsure, could go either way
+- 61-80: Fairly confident, probably right
+- 81-100: Very confident, almost certainly right
 
-Respond with your answer and confidence level.""",
-        schema=AnswerWithConfidence
-    )
+A well-calibrated confidence means: if you say 80%, you should be correct about 80% of the time.
 
-    is_correct = check_answer(response.answer, correct_answer)
-    confidence = max(0, min(100, response.confidence)) / 100.0
-    correctness = 1.0 if is_correct else 0.0
+Question: {question}""",
+            schema=AnswerWithConfidence
+        )
 
-    calibration_error = abs(confidence - correctness)
-    return round(1.0 - calibration_error, 4)
+        is_correct = check_answer(response.answer, correct_answer)
+        confidence = validate_confidence(response.confidence) / 100.0
+        correctness = 1.0 if is_correct else 0.0
+
+        calibration_error = abs(confidence - correctness)
+        return round(1.0 - calibration_error, 4)
+    except Exception as e:
+        print(f"[WARN] confidence_calibration failed: {e}")
+        return 0.0
 
 
 def confidence_calibration_inner(llm, question: str, correct_answer: str) -> float:

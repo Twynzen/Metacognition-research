@@ -1,17 +1,18 @@
 # ========================================
 # MetaCog-Bench: Measuring What AI Knows About What It Knows
 # Track: Metacognition
-# Authors: [Team]
+# Competition: Google DeepMind "Measuring Progress Toward AGI"
 # ========================================
 #
-# This benchmark tests 5 metacognitive abilities:
+# This benchmark tests 5 metacognitive abilities across ~900 items:
 # 1. Confidence Calibration (Nelson & Narens, 1990)
-# 2. Feeling-of-Knowing (Hart, 1965)
+# 2. Feeling-of-Knowing (Hart, 1965; Nelson & Dunlosky, 1991)
 # 3. Error Detection (Yeung & Summerfield, 2012)
 # 4. Selective Abstention (Koriat & Goldsmith, 1996)
-# 5. Metacognitive Knowledge (Flavell, 1979)
+# 5. Metacognitive Knowledge (Flavell, 1979; Dunning & Kruger, 1999)
 #
 # Metrics: ECE, Brier Score, AUROC2, Goodman-Kruskal Gamma
+# Primary metric: AUROC2 (bias-free, Fleming & Lau, 2014)
 # ========================================
 
 import kaggle_benchmarks as kbench
@@ -19,59 +20,94 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
+from itertools import combinations
 import random
 import re
 import unicodedata
 import math
-from itertools import combinations
+from sklearn.metrics import roc_auc_score
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+matplotlib.rcParams.update({
+    "font.size": 11,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "figure.dpi": 150,
+})
+HAS_MATPLOTLIB = True
 
-# ========================================
-# --- SCHEMAS ---
-# ========================================
+# ============================================================
+# SCHEMAS
+# ============================================================
+"""
+Structured output schemas for kaggle-benchmarks SDK.
+
+These dataclasses are used with `llm.prompt(..., schema=SchemaName)` to force
+structured JSON output from the model being evaluated.
+"""
+
 
 @dataclass
 class AnswerWithConfidence:
-    """Task 1: Confidence Calibration -- retrospective monitoring."""
+    """Task 1: Confidence Calibration — retrospective monitoring."""
     answer: str
     confidence: int  # 0-100
 
+
 @dataclass
 class FOKResponse:
-    """Task 2: Feeling-of-Knowing -- prospective monitoring."""
+    """Task 2: Feeling-of-Knowing — prospective monitoring."""
     prediction: int  # 0-100 likelihood of answering correctly
     answer: str
 
+
 @dataclass
 class ErrorReview:
-    """Task 3: Error Detection -- error monitoring."""
+    """Task 3: Error Detection — error monitoring."""
     has_error: bool
     error_explanation: str
     corrected_answer: str
 
+
 @dataclass
 class AbstentionResponse:
-    """Task 4: Selective Abstention -- metacognitive control."""
+    """Task 4: Selective Abstention — metacognitive control."""
     can_answer: bool
     answer: Optional[str]
     confidence: int  # 0-100
 
+
 @dataclass
 class DomainPrediction:
-    """Task 5: Metacognitive Knowledge -- self-knowledge."""
+    """Task 5: Metacognitive Knowledge — self-knowledge."""
     predicted_accuracy: int  # 0-100
     hardest_aspect: str
     easiest_aspect: str
 
-# ========================================
-# --- UTILITIES ---
-# ========================================
+
+# ============================================================
+# ANSWER CHECKER
+# ============================================================
+"""
+Deterministic answer checker shared across all tasks.
+
+CRITICAL: False negatives (marking correct answers wrong) corrupt ALL metrics.
+This function must handle: exact match, case insensitive, numerical tolerance,
+containment, yes/no keywords, and common normalizations.
+"""
+
 
 def normalize_text(text: str) -> str:
     """Normalize text for comparison: lowercase, strip, remove articles/punctuation."""
     text = text.strip().lower()
+    # Normalize unicode
     text = unicodedata.normalize("NFKD", text)
+    # Remove articles
     text = re.sub(r"\b(the|a|an)\b", "", text)
+    # Remove punctuation except decimal points in numbers
     text = re.sub(r"[^\w\s.]", "", text)
+    # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -91,7 +127,7 @@ def check_answer(model_answer: str, correct_answer: str) -> bool:
     Rules (applied in order):
     1. Normalize both strings and check exact match
     2. Check if correct answer is contained in model answer
-    3. Numerical comparison with tolerance (+/-0.01)
+    3. Numerical comparison with tolerance (±0.01)
     4. Yes/No keyword matching for boolean questions
     5. Single-letter answer matching (e.g., "A", "B", "C", "D")
 
@@ -131,20 +167,60 @@ def check_answer(model_answer: str, correct_answer: str) -> bool:
 
     # 5. Single-letter matching (for multiple choice)
     if len(correct_norm) == 1 and correct_norm.isalpha():
+        # Check if model answer starts with or contains just that letter
         first_word = model_norm.split()[0] if model_norm.split() else ""
         if first_word == correct_norm:
             return True
 
     return False
 
-# ========================================
-# --- METRICS ---
-# ========================================
+
+def validate_confidence(value, default=50):
+    """Safely extract and clamp confidence value to 0-100."""
+    if value is None:
+        return default
+    try:
+        v = int(value)
+        return max(0, min(100, v))
+    except (ValueError, TypeError):
+        return default
+
+
+def validate_bool(value, default=False):
+    """Safely extract boolean from schema output."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('true', 'yes', '1')
+    return default
+
+
+# ============================================================
+# METRICS: CALIBRATION
+# ============================================================
+"""
+Calibration metrics: ECE, MCE, Brier Score with Murphy decomposition.
+
+References:
+- Guo et al. (2017). On Calibration of Modern Neural Networks. ICML.
+- Murphy (1973). A new vector partition of the probability score.
+- Naeini et al. (2015). Obtaining well calibrated probabilities using Bayesian binning.
+"""
+
 
 def compute_ece(confidences, correctness, n_bins=10):
     """
     Expected Calibration Error with equal-width bins.
+
     ECE = sum_m (|B_m| / n) * |acc(B_m) - conf(B_m)|
+
+    Args:
+        confidences: array-like of float in [0, 1]
+        correctness: array-like of int/float in {0, 1}
+        n_bins: number of equal-width bins (default 10)
+
+    Returns:
+        dict with 'ece', 'mce', 'bin_data' (list of dicts for reliability diagram)
     """
     conf = np.array(confidences, dtype=float)
     corr = np.array(correctness, dtype=float)
@@ -158,6 +234,7 @@ def compute_ece(confidences, correctness, n_bins=10):
     mce = 0.0
 
     for i in range(n_bins):
+        # Use >= for the first bin to include confidence=0
         if i == 0:
             mask = (conf >= bin_boundaries[i]) & (conf <= bin_boundaries[i + 1])
         else:
@@ -189,14 +266,35 @@ def compute_ece(confidences, correctness, n_bins=10):
 
 
 def compute_brier(confidences, outcomes):
-    """Brier Score: BS = (1/N) * sum((f_i - o_i)^2)"""
+    """
+    Brier Score: BS = (1/N) * sum((f_i - o_i)^2)
+
+    BS = 0 is perfect; BS = 0.25 is no-skill baseline for balanced datasets.
+
+    Args:
+        confidences: array-like of float in [0, 1]
+        outcomes: array-like of int/float in {0, 1}
+
+    Returns:
+        float: Brier score
+    """
     conf = np.array(confidences, dtype=float)
     out = np.array(outcomes, dtype=float)
     return round(float(np.mean((conf - out) ** 2)), 4)
 
 
 def compute_brier_decomposition(confidences, outcomes, n_bins=10):
-    """Murphy (1973) decomposition: BS = Reliability - Resolution + Uncertainty"""
+    """
+    Murphy (1973) decomposition: BS = Reliability - Resolution + Uncertainty
+
+    Args:
+        confidences: array-like of float in [0, 1]
+        outcomes: array-like of int/float in {0, 1}
+        n_bins: number of bins
+
+    Returns:
+        dict with 'brier_score', 'reliability', 'resolution', 'uncertainty'
+    """
     conf = np.array(confidences, dtype=float)
     out = np.array(outcomes, dtype=float)
     n = len(conf)
@@ -232,19 +330,108 @@ def compute_brier_decomposition(confidences, outcomes, n_bins=10):
     }
 
 
+def conditional_ece(confidences, correctness, conditions, n_bins=10):
+    """
+    INNOV-001: ECE conditioned on a categorical variable (e.g., difficulty).
+
+    Measures calibration separately per condition level. A model may be well
+    calibrated on easy questions but poorly calibrated on hard ones — the
+    "hard-easy effect" from Lichtenstein & Fischhoff (1977).
+
+    Args:
+        confidences: array-like of float in [0, 1]
+        correctness: array-like of int/float in {0, 1}
+        conditions: array-like of str (e.g., ['easy', 'medium', 'hard'])
+        n_bins: bins for each sub-ECE
+
+    Returns:
+        dict of {condition_level: ece_value}
+    """
+    conf = np.array(confidences, dtype=float)
+    corr = np.array(correctness, dtype=float)
+    conds = np.array(conditions)
+
+    results = {}
+    for level in np.unique(conds):
+        mask = conds == level
+        if mask.sum() >= 20:  # minimum for stable ECE
+            sub_ece = compute_ece(conf[mask], corr[mask], n_bins=n_bins)
+            results[str(level)] = sub_ece["ece"]
+    return results
+
+
+def overconfidence_analysis(confidences, correctness):
+    """
+    METRIC-002: Decompose miscalibration into overconfidence vs underconfidence.
+
+    Provides insight into whether the model tends to be too confident when
+    wrong (overconfident) or too cautious when right (underconfident).
+
+    Args:
+        confidences: array-like of float in [0, 1]
+        correctness: array-like of int/float in {0, 1}
+
+    Returns:
+        dict with overconfidence_rate, underconfidence_rate, confidence_gap
+    """
+    conf = np.array(confidences, dtype=float)
+    corr = np.array(correctness, dtype=float)
+
+    # Overconfident: high confidence but wrong
+    overconf_mask = (conf > 0.7) & (corr == 0)
+    overconf_rate = float(overconf_mask.mean())
+
+    # Underconfident: low confidence but right
+    underconf_mask = (conf < 0.3) & (corr == 1)
+    underconf_rate = float(underconf_mask.mean())
+
+    # Mean confidence when correct vs incorrect
+    mean_conf_correct = float(conf[corr == 1].mean()) if (corr == 1).any() else 0.0
+    mean_conf_incorrect = float(conf[corr == 0].mean()) if (corr == 0).any() else 0.0
+
+    return {
+        "overconfidence_rate": round(overconf_rate, 4),
+        "underconfidence_rate": round(underconf_rate, 4),
+        "mean_conf_when_correct": round(mean_conf_correct, 4),
+        "mean_conf_when_incorrect": round(mean_conf_incorrect, 4),
+        "confidence_gap": round(mean_conf_correct - mean_conf_incorrect, 4),
+    }
+
+
+# ============================================================
+# METRICS: DISCRIMINATION
+# ============================================================
+"""
+Discrimination metrics: AUROC2 (metacognitive sensitivity) and Goodman-Kruskal Gamma.
+
+References:
+- Fleming & Lau (2014). How to measure metacognition. Frontiers in Human Neuroscience, 8:443.
+- Nelson (1984). A comparison of current measures of the accuracy of FOK judgments.
+- Goodman & Kruskal (1954). Measures of association for cross classifications.
+"""
+
+
 def compute_auroc2(confidences, correctness):
     """
     Type 2 AUROC: metacognitive sensitivity (bias-free).
+
     Measures whether the model assigns higher confidence to correct responses
-    than to incorrect ones.
+    than to incorrect ones. This is the SINGLE MOST IMPORTANT METRIC because
+    it is unaffected by overall over/underconfidence tendency.
+
+    Args:
+        confidences: array-like of float (any scale, typically [0, 1])
+        correctness: array-like of int/float in {0, 1}
+
+    Returns:
+        float: AUROC2 score. 0.5 = random, >0.7 = good, 1.0 = perfect.
     """
-    from sklearn.metrics import roc_auc_score
 
     conf = np.array(confidences, dtype=float)
     corr = np.array(correctness, dtype=float)
 
     if len(np.unique(corr)) < 2:
-        return 0.5
+        return 0.5  # Cannot compute without both correct and incorrect trials
 
     return round(float(roc_auc_score(corr, conf)), 4)
 
@@ -252,11 +439,26 @@ def compute_auroc2(confidences, correctness):
 def compute_gamma(confidences, correctness):
     """
     Goodman-Kruskal Gamma correlation for FOK accuracy.
+
     gamma = (concordant - discordant) / (concordant + discordant)
+
+    A concordant pair: one correct and one incorrect trial where the correct
+    trial has higher confidence. A discordant pair: the opposite.
+
+    This is the standard measure for metamemory resolution (Nelson, 1984).
+    Mathematical relationship: gamma = 2 * AUROC - 1
+
+    Args:
+        confidences: array-like of float
+        correctness: array-like of int/float in {0, 1}
+
+    Returns:
+        float: Gamma in [-1, 1]. Typical human FOK: 0.30-0.60.
     """
     conf = np.array(confidences, dtype=float)
     corr = np.array(correctness, dtype=float)
 
+    # Optimized: separate correct and incorrect trials, then count pairs
     correct_conf = conf[corr == 1]
     incorrect_conf = conf[corr == 0]
 
@@ -272,6 +474,7 @@ def compute_gamma(confidences, correctness):
                 concordant += 1
             elif c < ic:
                 discordant += 1
+            # ties are excluded (standard practice)
 
     denom = concordant + discordant
     if denom == 0:
@@ -280,14 +483,47 @@ def compute_gamma(confidences, correctness):
     return round(float((concordant - discordant) / denom), 4)
 
 
+# ============================================================
+# METRICS: AGGREGATE
+# ============================================================
+"""
+Aggregate scoring: geometric mean composite and bootstrap confidence intervals.
+
+The geometric mean prevents compensation between tasks — a model cannot
+make up for poor calibration with good error detection.
+"""
+
+
 def geometric_mean(sub_scores):
-    """Geometric mean of sub-task scores. Prevents compensation."""
+    """
+    Geometric mean of sub-task scores.
+
+    Prevents compensation: a zero on any task drives the composite to zero.
+    Epsilon floor (1e-10) avoids log(0) while preserving near-zero penalty.
+
+    Args:
+        sub_scores: list/array of float in [0, 1]
+
+    Returns:
+        float: geometric mean composite score
+    """
     values = [max(v, 1e-10) for v in sub_scores]
     return round(float(np.exp(np.mean(np.log(values)))), 4)
 
 
 def bootstrap_ci(scores, n_bootstrap=10000, ci=0.95, seed=None):
-    """Nonparametric bootstrap confidence intervals for any aggregate metric."""
+    """
+    Nonparametric bootstrap confidence intervals for any aggregate metric.
+
+    Args:
+        scores: array-like of per-item scores
+        n_bootstrap: number of bootstrap resamples
+        ci: confidence level (default 0.95 = 95% CI)
+        seed: random seed for reproducibility
+
+    Returns:
+        tuple: (lower_bound, upper_bound, mean)
+    """
     rng = np.random.RandomState(seed)
     scores = np.array(scores, dtype=float)
 
@@ -303,9 +539,25 @@ def bootstrap_ci(scores, n_bootstrap=10000, ci=0.95, seed=None):
 
     return round(lower, 4), round(upper, 4), round(mean, 4)
 
-# ========================================
-# --- DATASET GENERATION: Calibration & FOK ---
-# ========================================
+
+# ============================================================
+# DATASET: CALIBRATION & FOK (300 items)
+# ============================================================
+"""
+Calibration & FOK dataset generator.
+
+Generates 300 questions across 3 domains (math, factual, logic) × 3 difficulties
+(easy, medium, hard) with verifiably correct answers.
+
+Used by Task 1 (Confidence Calibration) and Task 2 (Feeling-of-Knowing).
+"""
+
+
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _is_prime(n: int) -> bool:
     if n < 2:
@@ -339,8 +591,13 @@ def _comb(n: int, k: int) -> int:
     return math.comb(n, k)
 
 
+# Pool of small-to-medium primes for hard math questions
 _PRIMES = [p for p in range(2, 200) if _is_prime(p)]
 
+
+# ---------------------------------------------------------------------------
+# MATH domain generators
+# ---------------------------------------------------------------------------
 
 def _generate_math_easy(rng: random.Random, n: int) -> List[Dict]:
     """Simple arithmetic: addition, subtraction, multiplication."""
@@ -349,7 +606,7 @@ def _generate_math_easy(rng: random.Random, n: int) -> List[Dict]:
     ops = [
         ("addition", "+", lambda a, b: a + b),
         ("subtraction", "-", lambda a, b: a - b),
-        ("multiplication", "\u00d7", lambda a, b: a * b),
+        ("multiplication", "×", lambda a, b: a * b),
     ]
     while len(items) < n:
         op_name, op_sym, op_fn = rng.choice(ops)
@@ -358,7 +615,7 @@ def _generate_math_easy(rng: random.Random, n: int) -> List[Dict]:
         else:
             a, b = rng.randint(10, 99), rng.randint(10, 99)
         if op_name == "subtraction" and a < b:
-            a, b = b, a
+            a, b = b, a  # keep positive
         key = (op_sym, a, b)
         if key in seen:
             continue
@@ -388,7 +645,7 @@ def _generate_math_medium(rng: random.Random, n: int) -> List[Dict]:
                 continue
             seen.add(key)
             ans = str((a * b) % m)
-            q = f"What is ({a} \u00d7 {b}) mod {m}?"
+            q = f"What is ({a} × {b}) mod {m}?"
             items.append({"question": q, "correct_answer": ans,
                            "difficulty": "medium", "domain": "math"})
 
@@ -427,7 +684,7 @@ def _generate_math_hard(rng: random.Random, n: int) -> List[Dict]:
         t = rng.choice(templates)
 
         if t == "prime_factor":
-            primes = rng.sample(_PRIMES[5:], 3)
+            primes = rng.sample(_PRIMES[5:], 3)  # skip 2,3,5,7,11
             primes.sort()
             product = primes[0] * primes[1] * primes[2]
             key = ("pf", product)
@@ -435,7 +692,7 @@ def _generate_math_hard(rng: random.Random, n: int) -> List[Dict]:
                 continue
             seen.add(key)
             largest = max(primes)
-            q = f"What is the largest prime factor of {product}?"
+            q = (f"What is the largest prime factor of {product}?")
             items.append({"question": q, "correct_answer": str(largest),
                            "difficulty": "hard", "domain": "math"})
 
@@ -453,6 +710,10 @@ def _generate_math_hard(rng: random.Random, n: int) -> List[Dict]:
                            "difficulty": "hard", "domain": "math"})
     return items
 
+
+# ---------------------------------------------------------------------------
+# FACTUAL domain — curated list with verified answers
+# ---------------------------------------------------------------------------
 
 _FACTUAL_EASY = [
     ("What is the chemical symbol for gold?", "Au"),
@@ -553,6 +814,22 @@ _FACTUAL_MEDIUM = [
     ("What is the speed of sound in air in m/s (approximately)?", "343"),
     ("What is the capital of Peru?", "Lima"),
     ("What is the most electronegative element?", "Fluorine"),
+    # Novel composition questions (combine known facts for contamination resistance)
+    ("What is the sum of the number of continents and the number of planets in our solar system?", "15"),  # 7+8
+    ("What is the product of the number of sides on a triangle and the number of sides on a pentagon?", "15"),  # 3*5
+    ("How many years between the signing of the Magna Carta (1215) and the French Revolution (1789)?", "574"),
+    ("What is the sum of the atomic number of Helium and the atomic number of Carbon?", "8"),  # 2+6
+    ("How many total letters are in the chemical symbols for Gold (Au) and Silver (Ag)?", "4"),
+    ("What is the sum of the number of US states and the number of Canadian provinces?", "60"),  # 50+10
+    ("How many years between Columbus reaching the Americas (1492) and the Moon landing (1969)?", "477"),
+    ("What is the product of the number of vowels in English and the number of primary colors?", "15"),  # 5*3
+    ("What is the sum of the boiling point and freezing point of water in Celsius?", "100"),  # 100+0
+    ("How many total strings are on a standard guitar and a standard violin?", "10"),  # 6+4
+    ("What is the square of the number of Harry Potter books?", "49"),  # 7^2
+    ("How many total wheels on a bicycle and a tricycle?", "5"),  # 2+3
+    ("What is the sum of the number of bones in the adult human body and the number of teeth?", "238"),  # 206+32
+    ("How many years between the end of WWI (1918) and the start of WWII (1939)?", "21"),
+    ("What is the product of the number of Great Lakes and the number of oceans?", "25"),  # 5*5
 ]
 
 _FACTUAL_HARD = [
@@ -605,6 +882,10 @@ def _generate_factual(rng: random.Random, n_easy: int, n_medium: int,
                        "difficulty": "hard", "domain": "factual"})
     return items
 
+
+# ---------------------------------------------------------------------------
+# LOGIC domain generators
+# ---------------------------------------------------------------------------
 
 _NAMES = [
     "Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Hank",
@@ -661,20 +942,30 @@ def _generate_logic_medium(rng: random.Random, n: int) -> List[Dict]:
         prop_comp, prop_min, prop_max = rng.choice(_PROPERTIES)
         num_people = rng.randint(4, 6)
         names = rng.sample(_NAMES, num_people)
+        # Build a random total ordering
         ordering = list(names)
         rng.shuffle(ordering)
+        # ordering[0] has the least of the property, ordering[-1] has the most
 
+        # Build pairwise clues: we reveal a spanning set of comparisons
+        # that uniquely determines the order
         clues = []
         revealed = set()
+        # Ensure a connected chain: compare adjacent pairs, then add a few extras
+        indices = list(range(num_people))
+        rng.shuffle(indices)
+        # Chain in random presentation order but covering adjacent pairs
         for i in range(num_people - 1):
             a_idx, b_idx = i, i + 1
             a_name, b_name = ordering[a_idx], ordering[b_idx]
+            # a < b in the property
             clues.append(f"{b_name} is {prop_comp} than {a_name}")
             revealed.add((a_idx, b_idx))
 
         rng.shuffle(clues)
         clue_text = ". ".join(clues) + "."
 
+        # Pick a question type
         q_type = rng.choice(["min", "max"])
         if q_type == "min":
             answer = ordering[0]
@@ -694,30 +985,39 @@ def _generate_logic_medium(rng: random.Random, n: int) -> List[Dict]:
 
 
 def _generate_logic_hard(rng: random.Random, n: int) -> List[Dict]:
-    """Constraint satisfaction with 4+ variables."""
+    """Constraint satisfaction with 4+ variables — seating / scheduling puzzles."""
     items = []
     seen = set()
 
+    # Template 1: Seating order with constraints
+    # Template 2: Who has what item
     colors = ["red", "blue", "green", "yellow", "purple", "orange"]
+    animals = ["dog", "cat", "bird", "fish", "rabbit", "hamster"]
+    drinks = ["water", "coffee", "tea", "juice", "milk", "soda"]
 
     while len(items) < n:
         template = rng.choice(["seating", "assignment"])
 
         if template == "seating":
+            # 4 people in a row, determine positions from constraints
             names = rng.sample(_NAMES, 4)
             order = list(names)
-            rng.shuffle(order)
+            rng.shuffle(order)  # order[0]=position 1, order[3]=position 4
 
             clues = []
+            # Clue 1: someone is at an end
             end_person = rng.choice([0, 3])
             pos_label = "first" if end_person == 0 else "last"
             clues.append(f"{order[end_person]} sits in the {pos_label} position")
 
+            # Clue 2: two people are adjacent
             adj_start = rng.randint(0, 2)
             clues.append(
                 f"{order[adj_start]} sits directly to the left of {order[adj_start + 1]}"
             )
 
+            # Clue 3: someone is NOT adjacent to someone else
+            # Pick two non-adjacent people
             non_adj_pairs = [(i, j) for i in range(4) for j in range(4)
                              if abs(i - j) > 1 and i < j]
             if non_adj_pairs:
@@ -726,30 +1026,36 @@ def _generate_logic_hard(rng: random.Random, n: int) -> List[Dict]:
                     f"{order[i]} does not sit next to {order[j]}"
                 )
 
+            # Clue 4: position clue
             mid = rng.choice([1, 2])
             clues.append(f"{order[mid]} sits in position {mid + 1}")
 
             rng.shuffle(clues)
             clue_text = ". ".join(clues) + "."
 
+            # Ask about a remaining person's position
             asked = rng.choice(range(4))
             q = (f"Four people sit in a row (positions 1-4, left to right). "
                  f"{clue_text} What position does {order[asked]} sit in?")
             answer = str(asked + 1)
 
-        else:
+        else:  # assignment
+            # 3 people each have a unique color
             names = rng.sample(_NAMES, 3)
             chosen_colors = rng.sample(colors, 3)
             assignment = dict(zip(names, chosen_colors))
 
             clues = []
+            # Clue 1: one person does NOT have a specific color
             wrong_person = rng.choice(names)
             wrong_colors = [c for c in chosen_colors if c != assignment[wrong_person]]
             clues.append(f"{wrong_person} does not have {rng.choice(wrong_colors)}")
 
+            # Clue 2: direct assignment
             direct = rng.choice(names)
             clues.append(f"{direct} has {assignment[direct]}")
 
+            # Clue 3: elimination
             other = [nm for nm in names if nm != direct][0]
             not_color = [c for c in chosen_colors if c != assignment[other]
                          and c != assignment[direct]]
@@ -759,6 +1065,7 @@ def _generate_logic_hard(rng: random.Random, n: int) -> List[Dict]:
             rng.shuffle(clues)
             clue_text = ". ".join(clues) + "."
 
+            # Ask about someone
             ask_name = rng.choice(names)
             q = (f"Three people ({', '.join(names)}) each have a different color "
                  f"from {{{', '.join(chosen_colors)}}}. "
@@ -774,23 +1081,41 @@ def _generate_logic_hard(rng: random.Random, n: int) -> List[Dict]:
     return items
 
 
+# ---------------------------------------------------------------------------
+# Main generator
+# ---------------------------------------------------------------------------
+
 def generate_calibration_dataset(n: int = 300) -> pd.DataFrame:
-    """Generate calibration/FOK dataset of n items (default 300)."""
+    """
+    Generate a calibration/FOK dataset of ``n`` items (default 300).
+
+    Returns a DataFrame with columns:
+        question, correct_answer, difficulty, domain
+
+    Difficulty distribution per domain (100 items each):
+        easy ~20%, medium ~60%, hard ~20%
+    """
     rng = random.Random(42)
+    # Temporarily override module-level random for reproducibility
     old_state = random.getstate()
     random.seed(42)
 
-    per_domain = n // 3
-    n_easy = round(per_domain * 0.20)
-    n_medium = round(per_domain * 0.60)
-    n_hard = per_domain - n_easy - n_medium
+    per_domain = n // 3  # 100
+    n_easy = round(per_domain * 0.20)   # 20
+    n_medium = round(per_domain * 0.60)  # 60
+    n_hard = per_domain - n_easy - n_medium  # 20
 
     all_items: List[Dict] = []
 
+    # Math domain
     all_items.extend(_generate_math_easy(rng, n_easy))
     all_items.extend(_generate_math_medium(rng, n_medium))
     all_items.extend(_generate_math_hard(rng, n_hard))
+
+    # Factual domain
     all_items.extend(_generate_factual(rng, n_easy, n_medium, n_hard))
+
+    # Logic domain
     all_items.extend(_generate_logic_easy(rng, n_easy))
     all_items.extend(_generate_logic_medium(rng, n_medium))
     all_items.extend(_generate_logic_hard(rng, n_hard))
@@ -798,16 +1123,38 @@ def generate_calibration_dataset(n: int = 300) -> pd.DataFrame:
     random.setstate(old_state)
 
     df = pd.DataFrame(all_items)
-    assert df["question"].nunique() == len(df), "Duplicate questions detected"
+
+    # Verify no duplicates
+    assert df["question"].nunique() == len(df), (
+        f"Duplicate questions detected: {len(df) - df['question'].nunique()} duplicates"
+    )
     assert len(df) == n, f"Expected {n} items, got {len(df)}"
+
     return df
 
 
-# ========================================
-# --- DATASET GENERATION: Error Detection ---
-# ========================================
+# ---------------------------------------------------------------------------
+# Quick self-test when run directly
+# ---------------------------------------------------------------------------
 
-def _prime_factors_ed(n: int) -> List[int]:
+
+# ============================================================
+# DATASET: ERROR DETECTION (200 items)
+# ============================================================
+"""
+Error Detection dataset generator for MetaCog-Bench.
+
+Generates 200 items: 100 correct solutions + 100 with planted (plausible) errors.
+Error types: arithmetic (~35), logical (~25), method (~20), factual (~20).
+"""
+
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _prime_factors(n: int) -> List[int]:
     """Return sorted list of prime factors of n."""
     factors = []
     d = 2
@@ -821,32 +1168,52 @@ def _prime_factors_ed(n: int) -> List[int]:
     return factors
 
 
+def _is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    if n < 4:
+        return True
+    if n % 2 == 0 or n % 3 == 0:
+        return False
+    i = 5
+    while i * i <= n:
+        if n % i == 0 or n % (i + 2) == 0:
+            return False
+        i += 6
+    return True
+
+
 def _gcd(a: int, b: int) -> int:
     while b:
         a, b = b, a % b
     return a
 
 
-def _comb_ed(n: int, k: int) -> int:
+def _comb(n: int, k: int) -> int:
     if k < 0 or k > n:
         return 0
     return math.factorial(n) // (math.factorial(k) * math.factorial(n - k))
 
 
+# ---------------------------------------------------------------------------
+# Arithmetic problem generators
+# ---------------------------------------------------------------------------
+
 def _arith_multiplication(rng: random.Random, inject_error: bool) -> Dict:
     a = rng.randint(12, 99)
     b = rng.randint(12, 99)
     correct = a * b
-    problem = f"What is {a} \u00d7 {b}?"
+    problem = f"What is {a} × {b}?"
     if inject_error:
+        # Near-miss: offset by a small plausible amount
         offsets = [10, -10, 1, -1, a, -a, b, -b]
         offset = rng.choice([o for o in offsets if o != 0])
         wrong = correct + offset
-        sol = f"{a} \u00d7 {b} = {wrong}"
+        sol = f"{a} × {b} = {wrong}"
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "true", "error_type": "arithmetic"}
     else:
-        sol = f"{a} \u00d7 {b} = {correct}"
+        sol = f"{a} × {b} = {correct}"
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "false", "error_type": "none"}
 
@@ -871,14 +1238,14 @@ def _arith_subtraction(rng: random.Random, inject_error: bool) -> Dict:
     a = rng.randint(100, 9999)
     b = rng.randint(10, a - 1)
     correct = a - b
-    problem = f"What is {a} \u2212 {b}?"
+    problem = f"What is {a} − {b}?"
     if inject_error:
         wrong = correct + rng.choice([1, -1, 10, -10, 100, -100])
-        sol = f"{a} \u2212 {b} = {wrong}"
+        sol = f"{a} − {b} = {wrong}"
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "true", "error_type": "arithmetic"}
     else:
-        sol = f"{a} \u2212 {b} = {correct}"
+        sol = f"{a} − {b} = {correct}"
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "false", "error_type": "none"}
 
@@ -887,14 +1254,14 @@ def _arith_division(rng: random.Random, inject_error: bool) -> Dict:
     b = rng.randint(2, 25)
     quotient = rng.randint(5, 200)
     a = b * quotient
-    problem = f"What is {a} \u00f7 {b}?"
+    problem = f"What is {a} ÷ {b}?"
     if inject_error:
         wrong = quotient + rng.choice([1, -1, 2, -2])
-        sol = f"{a} \u00f7 {b} = {wrong}"
+        sol = f"{a} ÷ {b} = {wrong}"
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "true", "error_type": "arithmetic"}
     else:
-        sol = f"{a} \u00f7 {b} = {quotient}"
+        sol = f"{a} ÷ {b} = {quotient}"
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "false", "error_type": "none"}
 
@@ -904,17 +1271,17 @@ def _arith_modular(rng: random.Random, inject_error: bool) -> Dict:
     b = rng.randint(10, 99)
     m = rng.choice([7, 11, 13, 17, 19, 23])
     correct = (a * b) % m
-    problem = f"What is ({a} \u00d7 {b}) mod {m}?"
+    problem = f"What is ({a} × {b}) mod {m}?"
     if inject_error:
         wrong = (correct + rng.randint(1, m - 1)) % m
         if wrong == correct:
             wrong = (correct + 1) % m
-        sol = (f"({a} \u00d7 {b}) = {a * b}. "
+        sol = (f"({a} × {b}) = {a * b}. "
                f"{a * b} mod {m} = {wrong}")
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "true", "error_type": "arithmetic"}
     else:
-        sol = (f"({a} \u00d7 {b}) = {a * b}. "
+        sol = (f"({a} × {b}) = {a * b}. "
                f"{a * b} mod {m} = {correct}")
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "false", "error_type": "none"}
@@ -938,32 +1305,43 @@ def _arith_exponentiation(rng: random.Random, inject_error: bool) -> Dict:
 
 def _arith_percentage(rng: random.Random, inject_error: bool) -> Dict:
     pct = rng.choice([5, 10, 12, 15, 20, 25, 30, 40])
-    base_val = rng.randint(2, 50) * 10
-    correct = base_val * pct / 100
-    problem = f"What is {pct}% of {base_val}?"
+    base = rng.randint(2, 50) * 10
+    correct = base * pct / 100
+    problem = f"What is {pct}% of {base}?"
     if inject_error:
-        wrong_options = [base_val * pct / 1000, base_val * (pct + 10) / 100,
-                         base_val * (pct - 5) / 100]
+        # Common mistake: misplace decimal or swap pct/base
+        wrong_options = [base * pct / 1000, base * (pct + 10) / 100,
+                         base * (pct - 5) / 100]
         wrong = rng.choice([w for w in wrong_options if w != correct and w > 0])
         if wrong == int(wrong):
             wrong = int(wrong)
-        sol = f"{pct}% of {base_val} = {wrong}"
+        sol = f"{pct}% of {base} = {wrong}"
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "true", "error_type": "arithmetic"}
     else:
         disp = int(correct) if correct == int(correct) else correct
-        sol = f"{pct}% of {base_val} = {disp}"
+        sol = f"{pct}% of {base} = {disp}"
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "false", "error_type": "none"}
 
 
 _ARITH_GENERATORS = [
-    _arith_multiplication, _arith_addition_chain, _arith_subtraction,
-    _arith_division, _arith_modular, _arith_exponentiation, _arith_percentage,
+    _arith_multiplication,
+    _arith_addition_chain,
+    _arith_subtraction,
+    _arith_division,
+    _arith_modular,
+    _arith_exponentiation,
+    _arith_percentage,
 ]
 
 
+# ---------------------------------------------------------------------------
+# Logical problem generators
+# ---------------------------------------------------------------------------
+
 def _logic_affirming_consequent(rng: random.Random) -> Dict:
+    """Affirming the consequent: if P→Q and Q, conclude P (invalid)."""
     templates = [
         {"p": "it is raining", "q": "the ground is wet"},
         {"p": "an animal is a dog", "q": "it is a mammal"},
@@ -992,36 +1370,65 @@ def _logic_affirming_consequent(rng: random.Random) -> Dict:
         f"we know that {t['p']} implies {t['q']}, "
         f"it follows that {t['p']}."
     )
-    return {"problem": problem, "presented_solution": sol,
-            "solution_has_error": "true", "error_type": "logical"}
+    return {
+        "problem": problem,
+        "presented_solution": sol,
+        "solution_has_error": "true",
+        "error_type": "logical",
+    }
 
 
 def _logic_false_dichotomy(rng: random.Random) -> Dict:
+    """False dichotomy: presenting only 2 options when more exist."""
     templates = [
-        {"setup": "A student can either study literature or study science",
-         "conclusion": "Since they are not studying literature, they must be studying science"},
-        {"setup": "A person is either happy or sad",
-         "conclusion": "Since they are not happy, they must be sad"},
-        {"setup": "An employee either supports the new policy or opposes the company",
-         "conclusion": "Since they don't support the new policy, they oppose the company"},
-        {"setup": "A country is either a democracy or a dictatorship",
-         "conclusion": "Since it is not a full democracy, it must be a dictatorship"},
-        {"setup": "A food is either healthy or unhealthy",
-         "conclusion": "Since chocolate is not purely healthy, it must be unhealthy"},
-        {"setup": "Software is either perfectly secure or completely vulnerable",
-         "conclusion": "Since the software has a minor bug, it is completely vulnerable"},
-        {"setup": "You either agree with me completely or you are against me",
-         "conclusion": "Since you raised an objection, you must be against me"},
-        {"setup": "A movie is either a masterpiece or garbage",
-         "conclusion": "Since critics found some flaws, the movie must be garbage"},
-        {"setup": "An investment either guarantees profit or is a total loss",
-         "conclusion": "Since the investment doesn't guarantee profit, it is a total loss"},
-        {"setup": "A person is either an expert or completely ignorant",
-         "conclusion": "Since they made one mistake, they must be completely ignorant"},
-        {"setup": "A scientific theory is either proven or worthless",
-         "conclusion": "Since the theory has not been proven beyond all doubt, it is worthless"},
-        {"setup": "An athlete is either world-class or terrible",
-         "conclusion": "Since they did not win the championship, they must be terrible"},
+        {
+            "setup": "A student can either study literature or study science",
+            "conclusion": "Since they are not studying literature, they must be studying science",
+        },
+        {
+            "setup": "A person is either happy or sad",
+            "conclusion": "Since they are not happy, they must be sad",
+        },
+        {
+            "setup": "An employee either supports the new policy or opposes the company",
+            "conclusion": "Since they don't support the new policy, they oppose the company",
+        },
+        {
+            "setup": "A country is either a democracy or a dictatorship",
+            "conclusion": "Since it is not a full democracy, it must be a dictatorship",
+        },
+        {
+            "setup": "A food is either healthy or unhealthy",
+            "conclusion": "Since chocolate is not purely healthy, it must be unhealthy",
+        },
+        {
+            "setup": "Software is either perfectly secure or completely vulnerable",
+            "conclusion": "Since the software has a minor bug, it is completely vulnerable",
+        },
+        {
+            "setup": "You either agree with me completely or you are against me",
+            "conclusion": "Since you raised an objection, you must be against me",
+        },
+        {
+            "setup": "A movie is either a masterpiece or garbage",
+            "conclusion": "Since critics found some flaws, the movie must be garbage",
+        },
+        {
+            "setup": "An investment either guarantees profit or is a total loss",
+            "conclusion": "Since the investment doesn't guarantee profit, it is a total loss",
+        },
+        {
+            "setup": "A person is either an expert or completely ignorant",
+            "conclusion": "Since they made one mistake, they must be completely ignorant",
+        },
+        {
+            "setup": "A scientific theory is either proven or worthless",
+            "conclusion": "Since the theory has not been proven beyond all doubt, it is worthless",
+        },
+        {
+            "setup": "An athlete is either world-class or terrible",
+            "conclusion": "Since they did not win the championship, they must be terrible",
+        },
     ]
     t = rng.choice(templates)
     problem = (
@@ -1032,11 +1439,16 @@ def _logic_false_dichotomy(rng: random.Random) -> Dict:
         f"Yes, this reasoning is valid. The two options are exhaustive, "
         f"so eliminating one necessarily leaves the other."
     )
-    return {"problem": problem, "presented_solution": sol,
-            "solution_has_error": "true", "error_type": "logical"}
+    return {
+        "problem": problem,
+        "presented_solution": sol,
+        "solution_has_error": "true",
+        "error_type": "logical",
+    }
 
 
 def _logic_invalid_syllogism(rng: random.Random) -> Dict:
+    """Undistributed middle: All A are B. All C are B. Therefore all C are A."""
     templates = [
         ("cats", "animals", "dogs"),
         ("roses", "plants", "trees"),
@@ -1064,18 +1476,35 @@ def _logic_invalid_syllogism(rng: random.Random) -> Dict:
         f"Yes, this syllogism is valid. Since all {a} are {b} "
         f"and all {c} are {b}, the {c} must also be {a}."
     )
-    return {"problem": problem, "presented_solution": sol,
-            "solution_has_error": "true", "error_type": "logical"}
+    return {
+        "problem": problem,
+        "presented_solution": sol,
+        "solution_has_error": "true",
+        "error_type": "logical",
+    }
 
 
 def _logic_denying_antecedent(rng: random.Random) -> Dict:
+    """Denying the antecedent: If P→Q, not P, therefore not Q (invalid)."""
     templates = [
         ("it snows", "the schools close", "the schools are open"),
         ("you eat too much sugar", "you may get cavities", "you won't get cavities"),
-        ("the temperature drops below 0\u00b0C", "water freezes", "water doesn't freeze"),
+        ("the temperature drops below 0 degrees C", "water freezes",
+         "water doesn't freeze"),
         ("you practice daily", "you improve", "you won't improve"),
-        ("a triangle is equilateral", "all its angles are 60\u00b0",
-         "none of its angles are 60\u00b0"),
+        ("a triangle is equilateral", "all its angles are 60 degrees",
+         "none of its angles are 60 degrees"),
+        ("a plant gets sunlight", "it grows", "it won't grow"),
+        ("the alarm rings", "people evacuate", "people won't evacuate"),
+        ("you take the medicine", "you feel better", "you won't feel better"),
+        ("a student attends lectures", "they learn the material",
+         "they won't learn the material"),
+        ("iron is exposed to moisture", "it rusts", "it won't rust"),
+        ("you add fertilizer", "the crops yield more",
+         "the crops won't yield more"),
+        ("a country invests in education", "literacy rates improve",
+         "literacy rates won't improve"),
+        ("a battery is charged", "the device works", "the device won't work"),
     ]
     p, q, notq = rng.choice(templates)
     problem = (
@@ -1088,11 +1517,16 @@ def _logic_denying_antecedent(rng: random.Random) -> Dict:
         f"Yes, the argument is valid. We know that {p} leads to {q}. "
         f"Since {p} is not the case, {notq}."
     )
-    return {"problem": problem, "presented_solution": sol,
-            "solution_has_error": "true", "error_type": "logical"}
+    return {
+        "problem": problem,
+        "presented_solution": sol,
+        "solution_has_error": "true",
+        "error_type": "logical",
+    }
 
 
 def _logic_correct_modus_ponens(rng: random.Random) -> Dict:
+    """A valid modus ponens — correct solution."""
     templates = [
         ("it is raining", "the ground is wet"),
         ("a number is divisible by 6", "it is divisible by 3"),
@@ -1126,11 +1560,16 @@ def _logic_correct_modus_ponens(rng: random.Random) -> Dict:
         f"Yes, this is a valid modus ponens argument. "
         f"Since {p} is true and {p} implies {q}, we can conclude that {q}."
     )
-    return {"problem": problem, "presented_solution": sol,
-            "solution_has_error": "false", "error_type": "none"}
+    return {
+        "problem": problem,
+        "presented_solution": sol,
+        "solution_has_error": "false",
+        "error_type": "none",
+    }
 
 
 def _logic_correct_modus_tollens(rng: random.Random) -> Dict:
+    """A valid modus tollens — correct solution."""
     templates = [
         ("it is raining", "the ground is wet", "the ground is not wet",
          "it is not raining"),
@@ -1174,14 +1613,24 @@ def _logic_correct_modus_tollens(rng: random.Random) -> Dict:
         f"Yes, this is a valid modus tollens argument. "
         f"Since {q} must follow from {p}, and {notq}, we conclude {notp}."
     )
-    return {"problem": problem, "presented_solution": sol,
-            "solution_has_error": "false", "error_type": "none"}
+    return {
+        "problem": problem,
+        "presented_solution": sol,
+        "solution_has_error": "false",
+        "error_type": "none",
+    }
 
+
+# ---------------------------------------------------------------------------
+# Method-error generators
+# ---------------------------------------------------------------------------
 
 def _method_average_speed(rng: random.Random, inject_error: bool) -> Dict:
+    """Average speed ≠ (v1+v2)/2 when distances are equal."""
     d = rng.choice([60, 100, 120, 150, 180, 200, 240])
     v1 = rng.choice([30, 40, 50, 60])
     v2 = rng.choice([v for v in [60, 80, 90, 100, 120] if v != v1])
+    # Correct: total_distance / total_time
     t1 = d / v1
     t2 = d / v2
     correct_avg = round(2 * d / (t1 + t2), 2)
@@ -1210,6 +1659,7 @@ def _method_average_speed(rng: random.Random, inject_error: bool) -> Dict:
 
 
 def _method_probability_or(rng: random.Random, inject_error: bool) -> Dict:
+    """P(A or B) ≠ P(A) + P(B) when events aren't mutually exclusive."""
     pa_num = rng.randint(2, 5)
     pb_num = rng.randint(2, 5)
     pab_num = rng.randint(1, min(pa_num, pb_num) - 1) if min(pa_num, pb_num) > 1 else 1
@@ -1226,7 +1676,7 @@ def _method_probability_or(rng: random.Random, inject_error: bool) -> Dict:
         f"football or basketball?"
     )
     if inject_error:
-        wrong = pa + pb
+        wrong = pa + pb  # forgot to subtract intersection
         sol = (
             f"P(football or basketball) = P(football) + P(basketball) "
             f"= {pa} + {pb} = {round(wrong, 2)}."
@@ -1243,6 +1693,7 @@ def _method_probability_or(rng: random.Random, inject_error: bool) -> Dict:
 
 
 def _method_percentage_change(rng: random.Random, inject_error: bool) -> Dict:
+    """% increase then same % decrease does NOT return to original."""
     pct = rng.choice([10, 20, 25, 30, 40, 50])
     original = rng.choice([100, 200, 400, 500, 1000])
     after_increase = original * (1 + pct / 100)
@@ -1262,9 +1713,9 @@ def _method_percentage_change(rng: random.Random, inject_error: bool) -> Dict:
                 "solution_has_error": "true", "error_type": "method"}
     else:
         sol = (
-            f"After {pct}% increase: ${original} \u00d7 {1 + pct / 100} "
+            f"After {pct}% increase: ${original} × {1 + pct / 100} "
             f"= ${after_increase:.2f}. "
-            f"After {pct}% decrease: ${after_increase:.2f} \u00d7 {1 - pct / 100} "
+            f"After {pct}% decrease: ${after_increase:.2f} × {1 - pct / 100} "
             f"= ${after_decrease:.2f}. "
             f"Net change: ${net_change:.2f}."
         )
@@ -1273,36 +1724,39 @@ def _method_percentage_change(rng: random.Random, inject_error: bool) -> Dict:
 
 
 def _method_combination_vs_permutation(rng: random.Random, inject_error: bool) -> Dict:
-    n_val = rng.randint(5, 12)
-    k = rng.randint(2, min(4, n_val - 1))
-    correct_comb = _comb_ed(n_val, k)
-    wrong_perm = math.factorial(n_val) // math.factorial(n_val - k)
+    """Using permutations when combinations are needed, or vice versa."""
+    n = rng.randint(5, 12)
+    k = rng.randint(2, min(4, n - 1))
+    correct_comb = _comb(n, k)
+    wrong_perm = math.factorial(n) // math.factorial(n - k)
 
     problem = (
         f"How many ways can you choose {k} people from a group "
-        f"of {n_val} to form a committee?"
+        f"of {n} to form a committee?"
     )
     if inject_error:
         sol = (
-            f"We need to pick {k} from {n_val}. "
-            f"The number of ways = {n_val}! / ({n_val}-{k})! = "
-            f"{n_val}! / {n_val - k}! = {wrong_perm}."
+            f"We need to pick {k} from {n}. "
+            f"The number of ways = {n}! / ({n}-{k})! = "
+            f"{n}! / {n - k}! = {wrong_perm}."
         )
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "true", "error_type": "method"}
     else:
         sol = (
-            f"C({n_val},{k}) = {n_val}! / ({k}! \u00d7 ({n_val}-{k})!) = {correct_comb}."
+            f"C({n},{k}) = {n}! / ({k}! × ({n}-{k})!) = {correct_comb}."
         )
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "false", "error_type": "none"}
 
 
 def _method_base_rate_neglect(rng: random.Random, inject_error: bool) -> Dict:
-    disease_rate = rng.choice([1, 2, 5])
+    """Ignoring base rate in conditional probability."""
+    disease_rate = rng.choice([1, 2, 5])  # per 1000
     sensitivity = rng.choice([95, 98, 99])
     false_pos = rng.choice([3, 5, 10])
 
+    # P(disease|positive) by Bayes
     p_d = disease_rate / 1000
     p_pos_given_d = sensitivity / 100
     p_pos_given_not_d = false_pos / 100
@@ -1326,147 +1780,303 @@ def _method_base_rate_neglect(rng: random.Random, inject_error: bool) -> Dict:
     else:
         sol = (
             f"Using Bayes' theorem: P(disease|+) = "
-            f"P(+|disease)\u00d7P(disease) / P(+). "
-            f"P(+) = ({p_pos_given_d}\u00d7{p_d}) + ({p_pos_given_not_d}\u00d7{1-p_d:.4f}) "
+            f"P(+|disease)×P(disease) / P(+). "
+            f"P(+) = ({p_pos_given_d}×{p_d}) + ({p_pos_given_not_d}×{1-p_d:.4f}) "
             f"= {p_pos:.6f}. "
-            f"P(disease|+) = {p_d*p_pos_given_d:.6f}/{p_pos:.6f} \u2248 {correct_ppv}%."
+            f"P(disease|+) = {p_d*p_pos_given_d:.6f}/{p_pos:.6f} ≈ {correct_ppv}%."
         )
         return {"problem": problem, "presented_solution": sol,
                 "solution_has_error": "false", "error_type": "none"}
 
 
 _METHOD_GENERATORS = [
-    _method_average_speed, _method_probability_or, _method_percentage_change,
-    _method_combination_vs_permutation, _method_base_rate_neglect,
+    _method_average_speed,
+    _method_probability_or,
+    _method_percentage_change,
+    _method_combination_vs_permutation,
+    _method_base_rate_neglect,
+]
+
+# Curated subtle method errors — these require metacognitive reasoning to detect
+_STATIC_METHOD_ERRORS = [
+    {
+        "problem": "A store offers 20% off, then an additional 15% off the reduced price. What is the total discount?",
+        "presented_solution": "Total discount = 20% + 15% = 35%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "You drive 60 miles at 30 mph, then 60 miles at 60 mph. What is your average speed for the whole trip?",
+        "presented_solution": "Average speed = (30 + 60) / 2 = 45 mph.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "A ball is thrown upward at 20 m/s. What is the maximum height reached? (Use g = 10 m/s².)",
+        "presented_solution": "Maximum height = v × t = 20 × 2 = 40 m. (Time to reach top = v/g = 20/10 = 2 s.)",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "What is the probability of getting at least one head in 3 coin flips?",
+        "presented_solution": "There are 3 flips and 6 possible outcomes. Favorable outcomes (at least one head) = 3. So probability = 3/6 = 50%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "In a room of 23 people, what is the probability that at least two people share a birthday? (Assume 365 days in a year.)",
+        "presented_solution": "There are 23 people and 365 possible birthdays. The probability is approximately 23/365 ≈ 6.3%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "A store offers 30% off, then an additional 20% off the reduced price. What is the total discount?",
+        "presented_solution": "Total discount = 30% + 20% = 50%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "You drive 100 miles at 25 mph, then 100 miles at 75 mph. What is your average speed for the whole trip?",
+        "presented_solution": "Average speed = (25 + 75) / 2 = 50 mph.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "A ball is thrown upward at 30 m/s. What is the maximum height reached? (Use g = 10 m/s².)",
+        "presented_solution": "Maximum height = v × t = 30 × 3 = 90 m. (Time to reach top = v/g = 30/10 = 3 s.)",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "What is the probability of getting at least one six in 4 rolls of a fair die?",
+        "presented_solution": "There are 4 rolls, each with a 1/6 chance of six. So the probability = 4 × (1/6) = 4/6 ≈ 66.7%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "In a room of 30 people, what is the probability that at least two people share a birthday? (Assume 365 days in a year.)",
+        "presented_solution": "There are 30 people and 365 possible birthdays. The probability is approximately 30/365 ≈ 8.2%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
 ]
 
 
-_FACTUAL_ITEMS_ED = [
-    ("In what year was the Declaration of Independence signed?",
-     "The Declaration of Independence was signed in 1776.",
-     "The Declaration of Independence was signed in 1774."),
-    ("Who wrote the novel '1984'?",
-     "'1984' was written by George Orwell.",
-     "'1984' was written by Aldous Huxley."),
-    ("What is the chemical formula for table salt?",
-     "The chemical formula for table salt is NaCl (sodium chloride).",
-     "The chemical formula for table salt is KCl (potassium chloride)."),
-    ("What is the speed of light in a vacuum, approximately?",
-     "The speed of light in a vacuum is approximately 3 \u00d7 10^8 m/s (299,792,458 m/s).",
-     "The speed of light in a vacuum is approximately 3 \u00d7 10^6 m/s (2,997,924 m/s)."),
-    ("Which planet is the largest in our solar system?",
-     "Jupiter is the largest planet in our solar system.",
-     "Saturn is the largest planet in our solar system."),
-    ("What is the boiling point of water at sea level in Celsius?",
-     "The boiling point of water at sea level is 100\u00b0C.",
-     "The boiling point of water at sea level is 110\u00b0C."),
-    ("Who painted the Sistine Chapel ceiling?",
-     "The Sistine Chapel ceiling was painted by Michelangelo.",
-     "The Sistine Chapel ceiling was painted by Raphael."),
-    ("What is the atomic number of carbon?",
-     "The atomic number of carbon is 6.",
-     "The atomic number of carbon is 8."),
-    ("In which year did World War I begin?",
-     "World War I began in 1914.",
-     "World War I began in 1912."),
-    ("What is the smallest prime number?",
-     "The smallest prime number is 2.",
-     "The smallest prime number is 1."),
-    ("Who discovered penicillin?",
-     "Penicillin was discovered by Alexander Fleming in 1928.",
-     "Penicillin was discovered by Louis Pasteur in 1928."),
-    ("What is the capital of Australia?",
-     "The capital of Australia is Canberra.",
-     "The capital of Australia is Sydney."),
-    ("How many chromosomes do humans have?",
-     "Humans have 46 chromosomes (23 pairs).",
-     "Humans have 48 chromosomes (24 pairs)."),
-    ("What is the most abundant gas in Earth's atmosphere?",
-     "Nitrogen is the most abundant gas in Earth's atmosphere, at about 78%.",
-     "Oxygen is the most abundant gas in Earth's atmosphere, at about 78%."),
-    ("Who formulated the three laws of motion?",
-     "The three laws of motion were formulated by Isaac Newton.",
-     "The three laws of motion were formulated by Galileo Galilei."),
-    ("What is the pH of pure water at 25\u00b0C?",
-     "The pH of pure water at 25\u00b0C is 7.",
-     "The pH of pure water at 25\u00b0C is 7.4."),
-    ("In what year did the Berlin Wall fall?",
-     "The Berlin Wall fell in 1989.",
-     "The Berlin Wall fell in 1991."),
-    ("What is the longest river in the world?",
-     "The Nile is generally considered the longest river in the world at about 6,650 km.",
-     "The Amazon is the longest river in the world at about 6,650 km."),
-    ("Who developed the theory of general relativity?",
-     "The theory of general relativity was developed by Albert Einstein, published in 1915.",
-     "The theory of general relativity was developed by Albert Einstein, published in 1905."),
-    ("What is the electron configuration of helium?",
-     "The electron configuration of helium is 1s\u00b2.",
-     "The electron configuration of helium is 1s\u00b9."),
-    ("Which element has the atomic number 79?",
-     "Gold (Au) has the atomic number 79.",
-     "Silver (Ag) has the atomic number 79."),
-    ("What is the diameter of Earth approximately?",
-     "Earth's diameter is approximately 12,742 km.",
-     "Earth's diameter is approximately 10,742 km."),
-    ("Who wrote 'The Republic'?",
-     "'The Republic' was written by Plato.",
-     "'The Republic' was written by Aristotle."),
-    ("What is the freezing point of mercury?",
-     "The freezing point of mercury is approximately -39\u00b0C (-38.83\u00b0C).",
-     "The freezing point of mercury is approximately -29\u00b0C."),
-    ("In what year was the Magna Carta signed?",
-     "The Magna Carta was signed in 1215.",
-     "The Magna Carta was signed in 1225."),
-    ("What is the half-life of Carbon-14?",
-     "The half-life of Carbon-14 is approximately 5,730 years.",
-     "The half-life of Carbon-14 is approximately 5,370 years."),
-    ("Which country has the largest land area?",
-     "Russia has the largest land area of any country, at about 17.1 million km\u00b2.",
-     "Canada has the largest land area of any country, at about 17.1 million km\u00b2."),
-    ("What is the value of Avogadro's number?",
-     "Avogadro's number is approximately 6.022 \u00d7 10^23.",
-     "Avogadro's number is approximately 6.022 \u00d7 10^26."),
-    ("Who composed 'The Four Seasons'?",
-     "'The Four Seasons' was composed by Antonio Vivaldi.",
-     "'The Four Seasons' was composed by Johann Sebastian Bach."),
-    ("What is the hardest natural mineral?",
-     "Diamond is the hardest natural mineral, rated 10 on the Mohs scale.",
-     "Corundum is the hardest natural mineral, rated 10 on the Mohs scale."),
-    ("In which year did the French Revolution begin?",
-     "The French Revolution began in 1789.",
-     "The French Revolution began in 1793."),
-    ("What is the SI unit of electric current?",
-     "The SI unit of electric current is the ampere (A).",
-     "The SI unit of electric current is the volt (V)."),
-    ("How many bones are in the adult human body?",
-     "The adult human body has 206 bones.",
-     "The adult human body has 208 bones."),
-    ("Who invented the telephone?",
-     "Alexander Graham Bell is credited with inventing the telephone in 1876.",
-     "Thomas Edison is credited with inventing the telephone in 1876."),
-    ("What is the formula for the area of a circle?",
-     "The area of a circle is A = \u03c0r\u00b2.",
-     "The area of a circle is A = 2\u03c0r."),
-    ("What is the deepest point in the ocean?",
-     "The Mariana Trench's Challenger Deep is the deepest point, at about 10,935 m.",
-     "The Mariana Trench's Challenger Deep is the deepest point, at about 8,935 m."),
-    ("Who was the first person to walk on the Moon?",
-     "Neil Armstrong was the first person to walk on the Moon on July 20, 1969.",
-     "Neil Armstrong was the first person to walk on the Moon on July 20, 1968."),
-    ("What is the currency of Japan?",
-     "The currency of Japan is the Japanese yen (\u00a5 / JPY).",
-     "The currency of Japan is the Japanese won (\u20a9 / JPW)."),
-    ("What is the tallest mountain in the world?",
-     "Mount Everest is the tallest mountain, at 8,849 metres above sea level.",
-     "Mount Everest is the tallest mountain, at 8,649 metres above sea level."),
-    ("Who painted the Mona Lisa?",
-     "The Mona Lisa was painted by Leonardo da Vinci.",
-     "The Mona Lisa was painted by Leonardo da Vinci in 1623."),
+# ---------------------------------------------------------------------------
+# Factual-error generators
+# ---------------------------------------------------------------------------
+
+_FACTUAL_ITEMS = [
+    # (problem, correct_solution, wrong_solution)
+    (
+        "In what year was the Declaration of Independence signed?",
+        "The Declaration of Independence was signed in 1776.",
+        "The Declaration of Independence was signed in 1774.",
+    ),
+    (
+        "Who wrote the novel '1984'?",
+        "'1984' was written by George Orwell.",
+        "'1984' was written by Aldous Huxley.",
+    ),
+    (
+        "What is the chemical formula for table salt?",
+        "The chemical formula for table salt is NaCl (sodium chloride).",
+        "The chemical formula for table salt is KCl (potassium chloride).",
+    ),
+    (
+        "What is the speed of light in a vacuum, approximately?",
+        "The speed of light in a vacuum is approximately 3 × 10^8 m/s (299,792,458 m/s).",
+        "The speed of light in a vacuum is approximately 3 × 10^6 m/s (2,997,924 m/s).",
+    ),
+    (
+        "Which planet is the largest in our solar system?",
+        "Jupiter is the largest planet in our solar system.",
+        "Saturn is the largest planet in our solar system.",
+    ),
+    (
+        "What is the boiling point of water at sea level in Celsius?",
+        "The boiling point of water at sea level is 100°C.",
+        "The boiling point of water at sea level is 110°C.",
+    ),
+    (
+        "Who painted the Sistine Chapel ceiling?",
+        "The Sistine Chapel ceiling was painted by Michelangelo.",
+        "The Sistine Chapel ceiling was painted by Raphael.",
+    ),
+    (
+        "What is the atomic number of carbon?",
+        "The atomic number of carbon is 6.",
+        "The atomic number of carbon is 8.",
+    ),
+    (
+        "In which year did World War I begin?",
+        "World War I began in 1914.",
+        "World War I began in 1912.",
+    ),
+    (
+        "What is the smallest prime number?",
+        "The smallest prime number is 2.",
+        "The smallest prime number is 1.",
+    ),
+    (
+        "Who discovered penicillin?",
+        "Penicillin was discovered by Alexander Fleming in 1928.",
+        "Penicillin was discovered by Louis Pasteur in 1928.",
+    ),
+    (
+        "What is the capital of Australia?",
+        "The capital of Australia is Canberra.",
+        "The capital of Australia is Sydney.",
+    ),
+    (
+        "How many chromosomes do humans have?",
+        "Humans have 46 chromosomes (23 pairs).",
+        "Humans have 48 chromosomes (24 pairs).",
+    ),
+    (
+        "What is the most abundant gas in Earth's atmosphere?",
+        "Nitrogen is the most abundant gas in Earth's atmosphere, at about 78%.",
+        "Oxygen is the most abundant gas in Earth's atmosphere, at about 78%.",
+    ),
+    (
+        "Who formulated the three laws of motion?",
+        "The three laws of motion were formulated by Isaac Newton.",
+        "The three laws of motion were formulated by Galileo Galilei.",
+    ),
+    (
+        "What is the pH of pure water at 25°C?",
+        "The pH of pure water at 25°C is 7.",
+        "The pH of pure water at 25°C is 7.4.",
+    ),
+    (
+        "In what year did the Berlin Wall fall?",
+        "The Berlin Wall fell in 1989.",
+        "The Berlin Wall fell in 1991.",
+    ),
+    (
+        "What is the longest river in the world?",
+        "The Nile is generally considered the longest river in the world at about 6,650 km.",
+        "The Amazon is the longest river in the world at about 6,650 km.",
+    ),
+    (
+        "Who developed the theory of general relativity?",
+        "The theory of general relativity was developed by Albert Einstein, published in 1915.",
+        "The theory of general relativity was developed by Albert Einstein, published in 1905.",
+    ),
+    (
+        "What is the electron configuration of helium?",
+        "The electron configuration of helium is 1s².",
+        "The electron configuration of helium is 1s¹.",
+    ),
+    (
+        "Which element has the atomic number 79?",
+        "Gold (Au) has the atomic number 79.",
+        "Silver (Ag) has the atomic number 79.",
+    ),
+    (
+        "What is the diameter of Earth approximately?",
+        "Earth's diameter is approximately 12,742 km.",
+        "Earth's diameter is approximately 10,742 km.",
+    ),
+    (
+        "Who wrote 'The Republic'?",
+        "'The Republic' was written by Plato.",
+        "'The Republic' was written by Aristotle.",
+    ),
+    (
+        "What is the freezing point of mercury?",
+        "The freezing point of mercury is approximately -39°C (-38.83°C).",
+        "The freezing point of mercury is approximately -29°C.",
+    ),
+    (
+        "In what year was the Magna Carta signed?",
+        "The Magna Carta was signed in 1215.",
+        "The Magna Carta was signed in 1225.",
+    ),
+    (
+        "What is the half-life of Carbon-14?",
+        "The half-life of Carbon-14 is approximately 5,730 years.",
+        "The half-life of Carbon-14 is approximately 5,370 years.",
+    ),
+    (
+        "Which country has the largest land area?",
+        "Russia has the largest land area of any country, at about 17.1 million km².",
+        "Canada has the largest land area of any country, at about 17.1 million km².",
+    ),
+    (
+        "What is the value of Avogadro's number?",
+        "Avogadro's number is approximately 6.022 × 10^23.",
+        "Avogadro's number is approximately 6.022 × 10^26.",
+    ),
+    (
+        "Who composed 'The Four Seasons'?",
+        "'The Four Seasons' was composed by Antonio Vivaldi.",
+        "'The Four Seasons' was composed by Johann Sebastian Bach.",
+    ),
+    (
+        "What is the hardest natural mineral?",
+        "Diamond is the hardest natural mineral, rated 10 on the Mohs scale.",
+        "Corundum is the hardest natural mineral, rated 10 on the Mohs scale.",
+    ),
+    (
+        "In which year did the French Revolution begin?",
+        "The French Revolution began in 1789.",
+        "The French Revolution began in 1793.",
+    ),
+    (
+        "What is the SI unit of electric current?",
+        "The SI unit of electric current is the ampere (A).",
+        "The SI unit of electric current is the volt (V).",
+    ),
+    (
+        "How many bones are in the adult human body?",
+        "The adult human body has 206 bones.",
+        "The adult human body has 208 bones.",
+    ),
+    (
+        "Who invented the telephone?",
+        "Alexander Graham Bell is credited with inventing the telephone in 1876.",
+        "Thomas Edison is credited with inventing the telephone in 1876.",
+    ),
+    (
+        "What is the formula for the area of a circle?",
+        "The area of a circle is A = πr².",
+        "The area of a circle is A = 2πr.",
+    ),
+    (
+        "What is the deepest point in the ocean?",
+        "The Mariana Trench's Challenger Deep is the deepest point, at about 10,935 m.",
+        "The Mariana Trench's Challenger Deep is the deepest point, at about 8,935 m.",
+    ),
+    (
+        "Who was the first person to walk on the Moon?",
+        "Neil Armstrong was the first person to walk on the Moon on July 20, 1969.",
+        "Neil Armstrong was the first person to walk on the Moon on July 20, 1968.",
+    ),
+    (
+        "What is the currency of Japan?",
+        "The currency of Japan is the Japanese yen (¥ / JPY).",
+        "The currency of Japan is the Japanese won (₩ / JPW).",
+    ),
+    (
+        "What is the tallest mountain in the world?",
+        "Mount Everest is the tallest mountain, at 8,849 metres above sea level.",
+        "Mount Everest is the tallest mountain, at 8,649 metres above sea level.",
+    ),
+    (
+        "Who painted the Mona Lisa?",
+        "The Mona Lisa was painted by Leonardo da Vinci.",
+        "The Mona Lisa was painted by Leonardo da Vinci in 1623.",
+    ),
 ]
 
 
-def _generate_unique_ed(rng, generator, used_problems, count,
-                        inject_error=None, max_retries=50):
+# ---------------------------------------------------------------------------
+# Main generation function
+# ---------------------------------------------------------------------------
+
+def _generate_unique(rng, generator, used_problems, count,
+                     inject_error=None, max_retries=50):
     """Generate items ensuring no duplicate problems."""
     items = []
     for _ in range(count):
@@ -1480,18 +2090,29 @@ def _generate_unique_ed(rng, generator, used_problems, count,
                 items.append(item)
                 break
         else:
+            # After max retries, accept even if duplicate (very rare for
+            # procedurally generated math with random params)
             items.append(item)
     return items
 
 
 def generate_error_detection_dataset(n: int = 200) -> pd.DataFrame:
-    """Generate error detection dataset: 50% correct, 50% with planted errors."""
+    """
+    Generate a dataset of problems with presented solutions for error detection.
+
+    Returns a DataFrame with columns:
+        problem, presented_solution, solution_has_error ("true"/"false"), error_type
+
+    Exactly 50% have errors. Among error items:
+        arithmetic ~35, logical ~25, method ~20, factual ~20.
+    """
     random.seed(42)
     rng = random.Random(42)
 
     n_error = n // 2
     n_correct = n - n_error
 
+    # Distribute error items across types (must sum to n_error)
     n_arith_err = 35 if n_error == 100 else round(0.35 * n_error)
     n_logic_err = 25 if n_error == 100 else round(0.25 * n_error)
     n_method_err = 20 if n_error == 100 else round(0.20 * n_error)
@@ -1500,81 +2121,151 @@ def generate_error_detection_dataset(n: int = 200) -> pd.DataFrame:
     items: List[Dict] = []
     used_problems: set = set()
 
-    # Arithmetic errors
+    # --- Arithmetic errors (procedurally generated, randomized params → unique) ---
     for _ in range(n_arith_err):
         gen = rng.choice(_ARITH_GENERATORS)
-        items.extend(_generate_unique_ed(rng, gen, used_problems, 1, inject_error=True))
+        items.extend(_generate_unique(rng, gen, used_problems, 1,
+                                      inject_error=True))
 
-    # Logical errors
+    # --- Logical errors ---
     logic_err_generators = [
-        _logic_affirming_consequent, _logic_false_dichotomy,
-        _logic_invalid_syllogism, _logic_denying_antecedent,
+        _logic_affirming_consequent,
+        _logic_false_dichotomy,
+        _logic_invalid_syllogism,
+        _logic_denying_antecedent,
     ]
     for i in range(n_logic_err):
         gen = logic_err_generators[i % len(logic_err_generators)]
-        items.extend(_generate_unique_ed(rng, gen, used_problems, 1))
+        items.extend(_generate_unique(rng, gen, used_problems, 1))
 
-    # Method errors
-    for i in range(n_method_err):
+    # --- Method errors ---
+    # First, include curated static method errors (shuffle and pick up to available)
+    static_method_pool = list(_STATIC_METHOD_ERRORS)
+    rng.shuffle(static_method_pool)
+    n_static_method = min(len(static_method_pool), n_method_err)
+    for item in static_method_pool[:n_static_method]:
+        if item["problem"] not in used_problems:
+            used_problems.add(item["problem"])
+            items.append(item)
+    # Fill remaining method error slots with procedural generators
+    n_method_remaining = n_method_err - n_static_method
+    for i in range(n_method_remaining):
         gen = _METHOD_GENERATORS[i % len(_METHOD_GENERATORS)]
-        items.extend(_generate_unique_ed(rng, gen, used_problems, 1, inject_error=True))
+        items.extend(_generate_unique(rng, gen, used_problems, 1,
+                                      inject_error=True))
 
-    # Factual errors
-    factual_pool = list(_FACTUAL_ITEMS_ED)
+    # --- Factual errors ---
+    # Partition factual pool: first n_factual_err for errors, rest for correct
+    factual_pool = list(_FACTUAL_ITEMS)
     rng.shuffle(factual_pool)
     factual_for_errors = factual_pool[:n_factual_err]
     factual_for_correct = factual_pool[n_factual_err:]
 
     for problem, _, wrong_sol in factual_for_errors:
         used_problems.add(problem)
-        items.append({"problem": problem, "presented_solution": wrong_sol,
-                      "solution_has_error": "true", "error_type": "factual"})
+        items.append({
+            "problem": problem,
+            "presented_solution": wrong_sol,
+            "solution_has_error": "true",
+            "error_type": "factual",
+        })
 
-    # Correct items
+    # --- Correct items ---
+    # Mix of arithmetic (correct), logic (correct), method (correct), factual (correct)
     n_arith_ok = n_correct // 4
     n_logic_ok = n_correct // 4
     n_method_ok = n_correct // 4
     n_factual_ok = n_correct - n_arith_ok - n_logic_ok - n_method_ok
 
+    # Correct arithmetic
     for _ in range(n_arith_ok):
         gen = rng.choice(_ARITH_GENERATORS)
-        items.extend(_generate_unique_ed(rng, gen, used_problems, 1, inject_error=False))
+        items.extend(_generate_unique(rng, gen, used_problems, 1,
+                                      inject_error=False))
 
+    # Correct logic
     logic_correct_generators = [_logic_correct_modus_ponens, _logic_correct_modus_tollens]
     for i in range(n_logic_ok):
         gen = logic_correct_generators[i % len(logic_correct_generators)]
-        items.extend(_generate_unique_ed(rng, gen, used_problems, 1))
+        items.extend(_generate_unique(rng, gen, used_problems, 1))
 
+    # Correct method
     for i in range(n_method_ok):
         gen = _METHOD_GENERATORS[i % len(_METHOD_GENERATORS)]
-        items.extend(_generate_unique_ed(rng, gen, used_problems, 1, inject_error=False))
+        items.extend(_generate_unique(rng, gen, used_problems, 1,
+                                      inject_error=False))
 
-    for i in range(n_factual_ok):
-        problem, correct_sol, _ = factual_for_correct[i % len(factual_for_correct)]
+    # Correct factual (from the partition not used for errors)
+    # If we need more correct factual items than available in the partition,
+    # also pull unused items from the full pool (including error partition items
+    # that weren't used for errors -- but all error partition items WERE used).
+    # To guarantee uniqueness, generate extra arithmetic items as fallback.
+    factual_ok_added = 0
+    for i in range(len(factual_for_correct)):
+        if factual_ok_added >= n_factual_ok:
+            break
+        problem, correct_sol, _ = factual_for_correct[i]
         if problem not in used_problems:
             used_problems.add(problem)
-        items.append({"problem": problem, "presented_solution": correct_sol,
-                      "solution_has_error": "false", "error_type": "none"})
+            items.append({
+                "problem": problem,
+                "presented_solution": correct_sol,
+                "solution_has_error": "false",
+                "error_type": "none",
+            })
+            factual_ok_added += 1
 
+    # Fill any remaining slots with extra correct arithmetic items
+    while factual_ok_added < n_factual_ok:
+        gen = rng.choice(_ARITH_GENERATORS)
+        extra = _generate_unique(rng, gen, used_problems, 1, inject_error=False)
+        items.extend(extra)
+        factual_ok_added += 1
+
+    # Shuffle all items
     rng.shuffle(items)
+
     df = pd.DataFrame(items)
+    # Ensure column order
     df = df[["problem", "presented_solution", "solution_has_error", "error_type"]]
     return df
 
 
-# ========================================
-# --- DATASET GENERATION: Abstention ---
-# ========================================
 
-_ABS_EASY_QUESTIONS = [
-    ("What is 7 \u00d7 8?", "56"), ("What is 12 + 19?", "31"),
-    ("What is 100 - 37?", "63"), ("What is 9 \u00d7 6?", "54"),
-    ("What is 144 / 12?", "12"), ("What is 15 + 28?", "43"),
-    ("What is 50 - 23?", "27"), ("What is 8 \u00d7 7?", "56"),
-    ("What is 81 / 9?", "9"), ("What is 25 + 36?", "61"),
-    ("What is 200 - 45?", "155"), ("What is 11 \u00d7 11?", "121"),
-    ("What is 72 / 8?", "9"), ("What is 33 + 44?", "77"),
-    ("What is 6 \u00d7 9?", "54"),
+# ============================================================
+# DATASET: ABSTENTION (200 items)
+# ============================================================
+"""
+Abstention dataset: 200 items (120 answerable + 80 unanswerable).
+
+Answerable questions have verifiably correct answers across math, science,
+geography, and history. Unanswerable questions span 5 categories (16 each).
+"""
+
+
+
+# ---------------------------------------------------------------------------
+# Answerable questions — Easy (40), Medium (50), Hard (30)
+# ---------------------------------------------------------------------------
+
+_EASY_QUESTIONS = [
+    # Math (15)
+    ("What is 7 × 8?", "56"),
+    ("What is 12 + 19?", "31"),
+    ("What is 100 - 37?", "63"),
+    ("What is 9 × 6?", "54"),
+    ("What is 144 / 12?", "12"),
+    ("What is 15 + 28?", "43"),
+    ("What is 50 - 23?", "27"),
+    ("What is 8 × 7?", "56"),
+    ("What is 81 / 9?", "9"),
+    ("What is 25 + 36?", "61"),
+    ("What is 200 - 45?", "155"),
+    ("What is 11 × 11?", "121"),
+    ("What is 72 / 8?", "9"),
+    ("What is 33 + 44?", "77"),
+    ("What is 6 × 9?", "54"),
+    # Science (10)
     ("What is the chemical symbol for gold?", "Au"),
     ("What is the chemical symbol for oxygen?", "O"),
     ("How many planets are in our solar system?", "8"),
@@ -1585,6 +2276,7 @@ _ABS_EASY_QUESTIONS = [
     ("What is the chemical symbol for sodium?", "Na"),
     ("How many bones are in the adult human body?", "206"),
     ("What is the speed of light in km/s, approximately?", "300000"),
+    # Geography (10)
     ("What is the capital of France?", "Paris"),
     ("What is the capital of Japan?", "Tokyo"),
     ("What is the largest continent by area?", "Asia"),
@@ -1595,6 +2287,7 @@ _ABS_EASY_QUESTIONS = [
     ("What is the smallest country in the world by area?", "Vatican City"),
     ("On which continent is Brazil located?", "South America"),
     ("What is the capital of Germany?", "Berlin"),
+    # History (5)
     ("In what year did World War II end?", "1945"),
     ("In what year did the United States declare independence?", "1776"),
     ("Who was the first President of the United States?", "George Washington"),
@@ -1602,22 +2295,30 @@ _ABS_EASY_QUESTIONS = [
     ("In what year did World War I begin?", "1914"),
 ]
 
-_ABS_MEDIUM_QUESTIONS = [
-    ("What is 347 + 589?", "936"), ("What is 23 \u00d7 17?", "391"),
-    ("What is the square root of 196?", "14"), ("What is 15% of 240?", "36"),
-    ("What is 1024 / 32?", "32"), ("What is 37 \u00d7 43?", "1591"),
-    ("What is 2 to the power of 10?", "1024"), ("What is 999 - 573?", "426"),
+_MEDIUM_QUESTIONS = [
+    # Math (15)
+    ("What is 347 + 589?", "936"),
+    ("What is 23 × 17?", "391"),
+    ("What is the square root of 196?", "14"),
+    ("What is 15% of 240?", "36"),
+    ("What is 1024 / 32?", "32"),
+    ("What is 37 × 43?", "1591"),
+    ("What is 2 to the power of 10?", "1024"),
+    ("What is 999 - 573?", "426"),
     ("What is the least common multiple of 12 and 18?", "36"),
     ("What is the greatest common divisor of 48 and 36?", "12"),
-    ("What is 125 \u00d7 8?", "1000"), ("What is the square root of 289?", "17"),
-    ("What is 45% of 200?", "90"), ("What is 7 to the power of 3?", "343"),
-    ("What is 3.5 \u00d7 2.4?", "8.4"),
+    ("What is 125 × 8?", "1000"),
+    ("What is the square root of 289?", "17"),
+    ("What is 45% of 200?", "90"),
+    ("What is 7 to the power of 3?", "343"),
+    ("What is 3.5 × 2.4?", "8.4"),
+    # Science (15)
     ("What is the atomic number of carbon?", "6"),
     ("What planet is known as the Red Planet?", "Mars"),
     ("What is the chemical symbol for potassium?", "K"),
     ("What is the hardest natural substance on Earth?", "Diamond"),
     ("What is the most abundant gas in Earth's atmosphere?", "Nitrogen"),
-    ("What is the pH of pure water at 25\u00b0C?", "7"),
+    ("What is the pH of pure water at 25°C?", "7"),
     ("What is the powerhouse of the cell?", "Mitochondria"),
     ("How many chromosomes do humans have?", "46"),
     ("What element has the atomic number 79?", "Gold"),
@@ -1627,6 +2328,7 @@ _ABS_MEDIUM_QUESTIONS = [
     ("What is the freezing point of water in Fahrenheit?", "32"),
     ("What vitamin is produced when skin is exposed to sunlight?", "Vitamin D"),
     ("How many valence electrons does carbon have?", "4"),
+    # Geography (10)
     ("What is the capital of South Korea?", "Seoul"),
     ("What is the deepest ocean trench in the world?", "Mariana Trench"),
     ("Through how many countries does the Danube River flow?", "10"),
@@ -1637,6 +2339,7 @@ _ABS_MEDIUM_QUESTIONS = [
     ("What is the capital of New Zealand?", "Wellington"),
     ("What is the most populous country in South America?", "Brazil"),
     ("What strait separates Europe from Asia at Istanbul?", "Bosphorus"),
+    # History (10)
     ("In what year was the Treaty of Westphalia signed?", "1648"),
     ("Who wrote 'The Republic'?", "Plato"),
     ("In what year did the French Revolution begin?", "1789"),
@@ -1649,15 +2352,17 @@ _ABS_MEDIUM_QUESTIONS = [
     ("Who was the first Emperor of Rome?", "Augustus"),
 ]
 
-_ABS_HARD_QUESTIONS = [
+_HARD_QUESTIONS = [
+    # Math (8)
     ("What is the largest prime factor of 2310?", "11"),
-    ("What is 17 \u00d7 23 mod 13?", "1"),
+    ("What is 17 × 23 mod 13?", "1"),
     ("What is the sum of the first 20 positive integers?", "210"),
     ("How many prime numbers are there between 1 and 50?", "15"),
     ("What is the value of 12 factorial divided by 10 factorial?", "132"),
     ("What is the cube root of 2744?", "14"),
     ("What is 2^16?", "65536"),
     ("What is the sum of interior angles of a hexagon in degrees?", "720"),
+    # Science (8)
     ("What is the atomic number of Rutherfordium?", "104"),
     ("What is the Avogadro constant to 3 significant figures?", "6.02e23"),
     ("What is the half-life of Carbon-14 in years, approximately?", "5730"),
@@ -1666,6 +2371,7 @@ _ABS_HARD_QUESTIONS = [
     ("What is the second most abundant element in Earth's crust?", "Silicon"),
     ("What is the escape velocity of Earth in km/s, approximately?", "11.2"),
     ("What is the name of the longest bone in the human body?", "Femur"),
+    # Geography (7)
     ("What is the capital of Myanmar?", "Naypyidaw"),
     ("What is the smallest country in mainland Africa by area?", "Gambia"),
     ("What is the highest capital city in the world by elevation?", "La Paz"),
@@ -1673,6 +2379,7 @@ _ABS_HARD_QUESTIONS = [
     ("What is the longest river in Europe?", "Volga"),
     ("What sea borders both Iran and Russia?", "Caspian Sea"),
     ("What is the deepest lake in the world?", "Lake Baikal"),
+    # History (7)
     ("In what year was the Battle of Hastings?", "1066"),
     ("Who was the last Pharaoh of ancient Egypt?", "Cleopatra"),
     ("What year was the Peace of Augsburg signed?", "1555"),
@@ -1681,6 +2388,10 @@ _ABS_HARD_QUESTIONS = [
     ("Who was the first Mughal emperor?", "Babur"),
     ("What treaty ended the Thirty Years' War?", "Treaty of Westphalia"),
 ]
+
+# ---------------------------------------------------------------------------
+# Unanswerable questions — 16 per category × 5 categories = 80
+# ---------------------------------------------------------------------------
 
 _FUTURE_UNKNOWN = [
     "Who will win the 2035 Nobel Prize in Physics?",
@@ -1740,11 +2451,21 @@ _FALSE_PREMISE = [
 ]
 
 _UNDERSPECIFIED = [
-    "How far is it?", "What time does it start?", "How much does it cost?",
-    "Is it bigger?", "What did they decide?", "When did he arrive?",
-    "How many are there?", "What is the answer?", "Did she win?",
-    "Where did it happen?", "Can you compare them?", "Which one is better?",
-    "How long did it take?", "What was the result?", "Who was responsible?",
+    "How far is it?",
+    "What time does it start?",
+    "How much does it cost?",
+    "Is it bigger?",
+    "What did they decide?",
+    "When did he arrive?",
+    "How many are there?",
+    "What is the answer?",
+    "Did she win?",
+    "Where did it happen?",
+    "Can you compare them?",
+    "Which one is better?",
+    "How long did it take?",
+    "What was the result?",
+    "Who was responsible?",
     "Is it safe?",
 ]
 
@@ -1769,19 +2490,30 @@ _GENUINELY_UNKNOWN = [
 
 
 def generate_abstention_dataset(n: int = 200) -> pd.DataFrame:
-    """Generate abstention dataset: 120 answerable + 80 unanswerable."""
+    """Generate the abstention dataset with 120 answerable + 80 unanswerable items.
+
+    Args:
+        n: Total number of items (default 200). The ratio 120:80 is maintained
+           proportionally if n != 200.
+
+    Returns:
+        DataFrame with columns: question, is_answerable, correct_answer,
+        unanswerable_reason
+    """
     random.seed(42)
 
     n_answerable = int(n * 0.6)
     n_unanswerable = n - n_answerable
 
+    # --- Answerable -----------------------------------------------------------
+    # Target distribution: ~33% easy, ~42% medium, ~25% hard
     n_easy = int(n_answerable * 40 / 120)
     n_hard = int(n_answerable * 30 / 120)
     n_medium = n_answerable - n_easy - n_hard
 
-    easy_pool = list(_ABS_EASY_QUESTIONS)
-    medium_pool = list(_ABS_MEDIUM_QUESTIONS)
-    hard_pool = list(_ABS_HARD_QUESTIONS)
+    easy_pool = list(_EASY_QUESTIONS)
+    medium_pool = list(_MEDIUM_QUESTIONS)
+    hard_pool = list(_HARD_QUESTIONS)
 
     random.shuffle(easy_pool)
     random.shuffle(medium_pool)
@@ -1793,11 +2525,16 @@ def generate_abstention_dataset(n: int = 200) -> pd.DataFrame:
 
     answerable_rows = []
     for q, a in easy_items + medium_items + hard_items:
-        answerable_rows.append({
-            "question": q, "is_answerable": "true",
-            "correct_answer": a, "unanswerable_reason": "",
-        })
+        answerable_rows.append(
+            {
+                "question": q,
+                "is_answerable": "true",
+                "correct_answer": a,
+                "unanswerable_reason": "",
+            }
+        )
 
+    # --- Unanswerable ---------------------------------------------------------
     categories = [
         ("future_unknown", _FUTURE_UNKNOWN),
         ("subjective", _SUBJECTIVE),
@@ -1816,37 +2553,65 @@ def generate_abstention_dataset(n: int = 200) -> pd.DataFrame:
         random.shuffle(selected)
         selected = selected[:count]
         for q in selected:
-            unanswerable_rows.append({
-                "question": q, "is_answerable": "false",
-                "correct_answer": "", "unanswerable_reason": reason,
-            })
+            unanswerable_rows.append(
+                {
+                    "question": q,
+                    "is_answerable": "false",
+                    "correct_answer": "",
+                    "unanswerable_reason": reason,
+                }
+            )
 
+    # Combine and shuffle
     all_rows = answerable_rows + unanswerable_rows
     random.shuffle(all_rows)
 
     df = pd.DataFrame(all_rows)
+
+    # Sanity checks
     assert len(df) == n, f"Expected {n} rows, got {len(df)}"
     assert df["question"].nunique() == len(df), "Duplicate questions found!"
+
     return df
 
 
-# ========================================
-# --- DATASET GENERATION: Self-Knowledge ---
-# ========================================
+
+# ============================================================
+# DATASET: SELF-KNOWLEDGE (20 domains x 10 questions)
+# ============================================================
+"""
+Self-Knowledge dataset for MetaCog-Bench Task 5: Metacognitive Knowledge.
+
+Generates 200 items (20 domains × 10 questions each). Each row represents
+one domain with pipe-separated questions and answers.
+"""
+
+
 
 def _build_domains():
     """Return a list of (domain_name, [(question, answer), ...]) tuples."""
+
     domains = []
 
-    # EASY DOMAINS
+    # ===================================================================
+    # EASY DOMAINS (model will know well)
+    # ===================================================================
+
+    # 1. Basic Arithmetic
     domains.append(("basic_arithmetic", [
-        ("What is 15 \u00d7 12?", "180"), ("What is 144 / 12?", "12"),
-        ("What is 256 + 389?", "645"), ("What is 1000 - 637?", "363"),
-        ("What is 25 \u00d7 25?", "625"), ("What is 729 / 27?", "27"),
-        ("What is 48 + 57?", "105"), ("What is 13 \u00d7 17?", "221"),
-        ("What is 900 / 15?", "60"), ("What is 333 + 444?", "777"),
+        ("What is 15 × 12?", "180"),
+        ("What is 144 / 12?", "12"),
+        ("What is 256 + 389?", "645"),
+        ("What is 1000 - 637?", "363"),
+        ("What is 25 × 25?", "625"),
+        ("What is 729 / 27?", "27"),
+        ("What is 48 + 57?", "105"),
+        ("What is 13 × 17?", "221"),
+        ("What is 900 / 15?", "60"),
+        ("What is 333 + 444?", "777"),
     ]))
 
+    # 2. World Capitals
     domains.append(("world_capitals", [
         ("What is the capital of France?", "Paris"),
         ("What is the capital of Japan?", "Tokyo"),
@@ -1860,6 +2625,7 @@ def _build_domains():
         ("What is the capital of Thailand?", "Bangkok"),
     ]))
 
+    # 3. Popular Movies
     domains.append(("popular_movies", [
         ("Who directed Jurassic Park?", "Steven Spielberg"),
         ("What year was The Matrix released?", "1999"),
@@ -1873,6 +2639,7 @@ def _build_domains():
         ("In The Shawshank Redemption, what is the name of the prison?", "Shawshank"),
     ]))
 
+    # 4. Basic Programming
     domains.append(("basic_programming", [
         ("What does HTML stand for?", "HyperText Markup Language"),
         ("What is the time complexity of binary search?", "O(log n)"),
@@ -1886,6 +2653,7 @@ def _build_domains():
         ("In most languages, what does the modulo operator (%) return?", "remainder"),
     ]))
 
+    # 5. Common Proverbs
     domains.append(("common_proverbs", [
         ("Complete: 'A penny saved is a penny ___'", "earned"),
         ("Complete: 'Actions speak louder than ___'", "words"),
@@ -1899,7 +2667,11 @@ def _build_domains():
         ("Complete: 'Every cloud has a silver ___'", "lining"),
     ]))
 
+    # ===================================================================
     # MEDIUM DOMAINS
+    # ===================================================================
+
+    # 6. Organic Chemistry
     domains.append(("organic_chemistry", [
         ("What is the IUPAC name for CH3OH?", "methanol"),
         ("What functional group does -COOH represent?", "carboxyl"),
@@ -1913,6 +2685,7 @@ def _build_domains():
         ("What is benzene's molecular formula?", "C6H6"),
     ]))
 
+    # 7. European History
     domains.append(("european_history", [
         ("In what year did the French Revolution begin?", "1789"),
         ("Who was the first Holy Roman Emperor?", "Charlemagne"),
@@ -1926,6 +2699,7 @@ def _build_domains():
         ("In what year was the Magna Carta signed?", "1215"),
     ]))
 
+    # 8. Music Theory
     domains.append(("music_theory", [
         ("How many sharps are in the key of D major?", "2"),
         ("What interval is C to G?", "perfect fifth"),
@@ -1939,6 +2713,7 @@ def _build_domains():
         ("How many lines are on a standard musical staff?", "5"),
     ]))
 
+    # 9. Astronomy
     domains.append(("astronomy", [
         ("What is the closest star to our solar system?", "Proxima Centauri"),
         ("What planet has the Great Red Spot?", "Jupiter"),
@@ -1952,6 +2727,7 @@ def _build_domains():
         ("What planet is known for its prominent ring system?", "Saturn"),
     ]))
 
+    # 10. Classical Literature
     domains.append(("classical_literature", [
         ("Who wrote 'War and Peace'?", "Leo Tolstoy"),
         ("In which century was 'The Canterbury Tales' written?", "14th century"),
@@ -1965,7 +2741,11 @@ def _build_domains():
         ("Who wrote 'Pride and Prejudice'?", "Jane Austen"),
     ]))
 
-    # HARD DOMAINS
+    # ===================================================================
+    # HARD DOMAINS (model will struggle)
+    # ===================================================================
+
+    # 11. Koine Greek Grammar
     domains.append(("koine_greek_grammar", [
         ("How many noun declensions are there in Koine Greek?", "3"),
         ("What case is used for the direct object in Koine Greek?", "accusative"),
@@ -1979,6 +2759,7 @@ def _build_domains():
         ("What case is used for the indirect object in Koine Greek?", "dative"),
     ]))
 
+    # 12. Advanced Topology
     domains.append(("advanced_topology", [
         ("What is the fundamental group of the circle S1?", "Z"),
         ("How many dimensions does a torus have as a surface?", "2"),
@@ -1992,6 +2773,7 @@ def _build_domains():
         ("Is the real projective plane orientable?", "No"),
     ]))
 
+    # 13. Uzbek Geography
     domains.append(("uzbek_geography", [
         ("What is the capital of Uzbekistan?", "Tashkent"),
         ("What large saltwater lake borders Uzbekistan and Kazakhstan?", "Aral Sea"),
@@ -2005,6 +2787,7 @@ def _build_domains():
         ("What is the highest point in Uzbekistan called?", "Khazret Sultan"),
     ]))
 
+    # 14. Medieval Numismatics
     domains.append(("medieval_numismatics", [
         ("What was the main gold coin of the Byzantine Empire?", "solidus"),
         ("What English silver coin was worth one-twelfth of a shilling?", "penny"),
@@ -2018,6 +2801,7 @@ def _build_domains():
         ("What was the standard silver coin of the medieval Islamic world?", "dirham"),
     ]))
 
+    # 15. Niche Sports Statistics
     domains.append(("niche_sports_statistics", [
         ("In cricket, who holds the record for the highest individual Test score of 400 not out?", "Brian Lara"),
         ("What country has won the most Olympic gold medals in handball (men's)?", "France"),
@@ -2031,7 +2815,11 @@ def _build_domains():
         ("In cricket, what is the term for a bowler taking 3 wickets in 3 consecutive balls?", "hat-trick"),
     ]))
 
+    # ===================================================================
     # TRICK / SPECIAL DOMAINS
+    # ===================================================================
+
+    # 16. Common Misconceptions
     domains.append(("common_misconceptions", [
         ("What color are school buses: yellow or orange? (official federal standard)", "yellow"),
         ("Did the Great Wall of China get built all at once?", "No"),
@@ -2045,6 +2833,7 @@ def _build_domains():
         ("Did Vikings wear horned helmets?", "No"),
     ]))
 
+    # 17. Riddles with Counterintuitive Answers
     domains.append(("riddles_counterintuitive", [
         ("A farmer has 17 sheep. All but 9 die. How many sheep are left?", "9"),
         ("How many times can you subtract 5 from 25?", "1"),
@@ -2058,6 +2847,7 @@ def _build_domains():
         ("What can you hold in your right hand but never in your left hand?", "your left hand"),
     ]))
 
+    # 18. Regional Cooking
     domains.append(("regional_cooking", [
         ("What is the main ingredient in the Japanese soup stock called dashi?", "kombu"),
         ("What spice gives paella its characteristic yellow color?", "saffron"),
@@ -2071,6 +2861,7 @@ def _build_domains():
         ("What fermented fish sauce is a staple condiment in Thai cooking?", "nam pla"),
     ]))
 
+    # 19. Ancient Measurement Systems
     domains.append(("ancient_measurement_systems", [
         ("Approximately how long is one cubit in modern inches?", "18"),
         ("What ancient unit of distance equals about 600 feet or 185 meters?", "stadion"),
@@ -2084,6 +2875,7 @@ def _build_domains():
         ("What was the ancient Greek unit of length equal to the width of a finger?", "daktylos"),
     ]))
 
+    # 20. Fictional Geography
     domains.append(("fictional_geography", [
         ("In Lord of the Rings, what is the name of the elven realm ruled by Galadriel?", "Lothlorien"),
         ("In Game of Thrones, what is the seat of House Stark?", "Winterfell"),
@@ -2101,11 +2893,22 @@ def _build_domains():
 
 
 def generate_self_knowledge_dataset(n=200):
-    """Generate self-knowledge dataset: 20 domains x 10 questions each."""
+    """
+    Generate the self-knowledge dataset: 20 domains × 10 questions each.
+
+    Returns a DataFrame with 20 rows (one per domain). Each row contains:
+      - domain: str — name of the knowledge domain
+      - domain_questions: str — 10 questions joined by '|||'
+      - domain_answers: str — 10 answers joined by '|||'
+
+    The n parameter exists for API compatibility but is ignored;
+    the dataset always has 20 rows totalling 200 question-answer pairs.
+    """
     random.seed(42)
 
     domains = _build_domains()
 
+    # Shuffle question order within each domain for variety
     for _name, qa_pairs in domains:
         random.shuffle(qa_pairs)
 
@@ -2114,8 +2917,10 @@ def generate_self_knowledge_dataset(n=200):
         questions = [q for q, _a in qa_pairs]
         answers = [a for _q, a in qa_pairs]
 
-        assert len(questions) == 10
-        assert len(answers) == 10
+        assert len(questions) == 10, f"Domain '{domain_name}' has {len(questions)} questions, expected 10"
+        assert len(answers) == 10, f"Domain '{domain_name}' has {len(answers)} answers, expected 10"
+        assert all(q.strip() for q in questions), f"Domain '{domain_name}' has empty question(s)"
+        assert all(a.strip() for a in answers), f"Domain '{domain_name}' has empty answer(s)"
 
         rows.append({
             "domain": domain_name,
@@ -2124,308 +2929,128 @@ def generate_self_knowledge_dataset(n=200):
         })
 
     df = pd.DataFrame(rows)
-    assert len(df) == 20
+    assert len(df) == 20, f"Expected 20 domains, got {len(df)}"
     return df
 
 
-# ========================================
-# --- GENERATE ALL DATASETS ---
-# ========================================
 
-random.seed(42)
-calibration_df = generate_calibration_dataset(n=300)
-error_df = generate_error_detection_dataset(n=200)
-abstention_df = generate_abstention_dataset(n=200)
-selfknow_df = generate_self_knowledge_dataset(n=200)
+# ============================================================
+# VISUALIZATIONS
+# ============================================================
+"""
+Publication-quality visualizations for MetaCog-Bench.
 
-# ========================================
-# --- BUILD UNIFIED EVALUATION DATA ---
-# ========================================
+1. Reliability Diagram — calibration per model
+2. Radar Chart — metacognitive profile comparison
+3. Model Comparison Table — formatted metrics summary
+"""
 
-# Calibration task data
-cal_data = calibration_df.copy()
-cal_data['task_type'] = 'calibration'
-cal_data['extra_data'] = ''
+HAS_MATPLOTLIB = True
 
-# FOK task data (same questions, different task)
-fok_data = calibration_df.copy()
-fok_data['task_type'] = 'fok'
-fok_data['extra_data'] = ''
 
-# Error detection task data
-err_data = error_df.copy()
-err_data = err_data.rename(columns={'problem': 'question', 'presented_solution': 'correct_answer'})
-err_data['task_type'] = 'error_detection'
-err_data['extra_data'] = err_data['solution_has_error'] + '|' + err_data['error_type']
-err_data['difficulty'] = 'medium'
-
-# Abstention task data
-abs_data = abstention_df.copy()
-abs_data['task_type'] = 'abstention'
-abs_data['extra_data'] = abs_data['is_answerable'] + '|' + abs_data['unanswerable_reason']
-abs_data['difficulty'] = 'medium'
-
-# Self-knowledge task data
-sk_data = selfknow_df.copy()
-sk_data = sk_data.rename(columns={'domain': 'question', 'domain_questions': 'correct_answer'})
-sk_data['task_type'] = 'self_knowledge'
-sk_data['extra_data'] = sk_data['domain_answers']
-sk_data['difficulty'] = 'medium'
-
-# Unify columns
-for df in [cal_data, fok_data, err_data, abs_data, sk_data]:
-    for col in ['question', 'correct_answer', 'difficulty', 'task_type', 'extra_data']:
-        if col not in df.columns:
-            df[col] = ''
-
-all_data = pd.concat([
-    cal_data[['question', 'correct_answer', 'difficulty', 'task_type', 'extra_data']],
-    fok_data[['question', 'correct_answer', 'difficulty', 'task_type', 'extra_data']],
-    err_data[['question', 'correct_answer', 'difficulty', 'task_type', 'extra_data']],
-    abs_data[['question', 'correct_answer', 'difficulty', 'task_type', 'extra_data']],
-    sk_data[['question', 'correct_answer', 'difficulty', 'task_type', 'extra_data']],
-], ignore_index=True)
-
-print(f"Total evaluation items: {len(all_data)}")
-print(f"Task distribution:\n{all_data['task_type'].value_counts().to_string()}")
-
-# ========================================
-# --- COMPOSITE TASK ---
-# ========================================
-
-@kbench.task(
-    name="metacog_bench",
-    description="MetaCog-Bench: Comprehensive metacognition benchmark testing "
-                "calibration, FOK, error detection, abstention, and self-knowledge. "
-                "Based on Nelson & Narens (1990), Fleming & Lau (2014), and "
-                "Flavell (1979) metacognitive frameworks."
-)
-def metacog_bench(llm, task_type: str, question: str, correct_answer: str,
-                  difficulty: str, extra_data: str) -> float:
+def plot_reliability_diagram(bin_data, model_name="Model", ax=None):
     """
-    Unified metacognition benchmark dispatcher.
-    Routes each item to the appropriate task implementation based on task_type.
+    Publication-quality reliability diagram.
+
+    X-axis: Mean predicted confidence per bin
+    Y-axis: Fraction correct per bin
+    Perfect calibration: diagonal line
+    Gap shown between bars and diagonal
+
+    Args:
+        bin_data: list of dicts from compute_ece()['bin_data']
+        model_name: string for title/legend
+        ax: optional matplotlib Axes (creates new figure if None)
+
+    Returns:
+        matplotlib Figure (or None if no matplotlib)
     """
+    if not HAS_MATPLOTLIB:
+        return None
 
-    if task_type == "calibration":
-        # ---- Task 1: Confidence Calibration ----
-        response = llm.prompt(
-            f"Answer the following question. After your answer, rate your "
-            f"confidence from 0 to 100 (where 0 = certainly wrong, "
-            f"100 = certainly correct).\n\n"
-            f"Question: {question}\n\n"
-            f"Respond with your answer and confidence level.",
-            schema=AnswerWithConfidence
-        )
-        is_correct = check_answer(response.answer, correct_answer)
-        confidence = max(0, min(100, response.confidence)) / 100.0
-        correctness = 1.0 if is_correct else 0.0
-        calibration_error = abs(confidence - correctness)
-        return round(1.0 - calibration_error, 4)
+    fig = None
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
 
-    elif task_type == "fok":
-        # ---- Task 2: Feeling-of-Knowing ----
-        fok_response = llm.prompt(
-            f"I'm going to ask you a question. Before you answer, predict "
-            f"how likely you are to get it correct on a scale of 0-100.\n\n"
-            f"Then provide your best answer.\n\n"
-            f"Question: {question}",
-            schema=FOKResponse
-        )
-        is_correct = check_answer(fok_response.answer, correct_answer)
-        prediction = max(0, min(100, fok_response.prediction)) / 100.0
-        correctness = 1.0 if is_correct else 0.0
-        fok_error = abs(prediction - correctness)
-        return round(1.0 - fok_error, 4)
+    centers = [b["bin_center"] for b in bin_data]
+    accs = [b["accuracy"] for b in bin_data]
+    confs = [b["confidence"] for b in bin_data]
+    counts = [b["count"] for b in bin_data]
 
-    elif task_type == "error_detection":
-        # ---- Task 3: Error Detection ----
-        # question = problem, correct_answer = presented_solution
-        # extra_data = "solution_has_error|error_type"
-        parts = extra_data.split("|")
-        solution_has_error = parts[0] if len(parts) > 0 else "false"
+    # Perfect calibration line
+    ax.plot([0, 1], [0, 1], "k--", alpha=0.5, linewidth=1.5,
+            label="Perfect calibration")
 
-        response = llm.prompt(
-            f"Here is a problem and a proposed solution. Please review the "
-            f"solution carefully and determine if it is correct.\n\n"
-            f"Problem: {question}\n\n"
-            f"Proposed Solution: {correct_answer}\n\n"
-            f"Is this solution correct? If not, explain the error and "
-            f"provide the correct answer.",
-            schema=ErrorReview
-        )
+    # Bars showing actual accuracy
+    width = 0.08
+    bars = ax.bar(centers, accs, width=width, alpha=0.7, color="steelblue",
+                  edgecolor="black", linewidth=0.5, label=f"{model_name}")
 
-        has_error = solution_has_error.lower() == "true"
+    # Gap visualization (red shading between bar and diagonal)
+    for c, a in zip(centers, accs):
+        if a < c:
+            ax.bar(c, c - a, width=width, bottom=a, alpha=0.2,
+                   color="red", edgecolor="none")
+        elif a > c:
+            ax.bar(c, a - c, width=width, bottom=c, alpha=0.2,
+                   color="green", edgecolor="none")
 
-        if has_error and response.has_error:
-            return 1.0  # True positive
-        elif not has_error and not response.has_error:
-            return 1.0  # True negative
-        else:
-            return 0.0  # Misclassification
+    ax.set_xlabel("Mean Predicted Confidence")
+    ax.set_ylabel("Fraction of Positives (Accuracy)")
+    ax.set_title(f"Reliability Diagram — {model_name}")
+    ax.legend(loc="upper left")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
 
-    elif task_type == "abstention":
-        # ---- Task 4: Selective Abstention ----
-        # extra_data = "is_answerable|unanswerable_reason"
-        parts = extra_data.split("|")
-        is_answerable = parts[0] if len(parts) > 0 else "true"
-
-        response = llm.prompt(
-            f"Answer the following question. If you genuinely cannot "
-            f"determine the answer or the question is unanswerable, "
-            f"say \"I don't know\" and explain why.\n\n"
-            f"Question: {question}",
-            schema=AbstentionResponse
-        )
-
-        answerable = is_answerable.lower() == "true"
-        abstained = not response.can_answer or (
-            response.answer and "i don't know" in response.answer.lower()
-        )
-
-        if answerable:
-            if abstained:
-                return 0.25  # Overly cautious
-            elif check_answer(response.answer or "", correct_answer):
-                return 1.0   # Correct
-            else:
-                return 0.0   # Wrong
-        else:  # Unanswerable
-            if abstained:
-                return 1.0   # Correctly abstained
-            else:
-                return 0.0   # Hallucinated an answer
-
-    elif task_type == "self_knowledge":
-        # ---- Task 5: Metacognitive Knowledge ----
-        # question = domain name, correct_answer = pipe-separated questions
-        # extra_data = pipe-separated answers
-        domain = question
-        domain_questions = correct_answer
-        domain_answers = extra_data
-
-        # Phase 1: Self-assessment
-        prediction = llm.prompt(
-            f"I'm going to test you on 10 questions about {domain}. "
-            f"Before I do, predict what percentage (0-100) you'll get "
-            f"correct. Also tell me what you think will be hardest and "
-            f"easiest.",
-            schema=DomainPrediction
-        )
-
-        # Phase 2: Answer domain questions sequentially
-        questions = domain_questions.split("|||")
-        answers = domain_answers.split("|||")
-        correct_count = 0
-
-        for q, a in zip(questions, answers):
-            resp = llm.prompt(f"Answer briefly: {q}")
-            if check_answer(str(resp), a):
-                correct_count += 1
-
-        actual_accuracy = correct_count / len(questions)
-        predicted = max(0, min(100, prediction.predicted_accuracy)) / 100.0
-
-        error = abs(predicted - actual_accuracy)
-        return round(1.0 - error, 4)
-
-    # Fallback (should not reach here)
-    return 0.0
+    if fig:
+        fig.tight_layout()
+    return fig
 
 
-# ========================================
-# --- RUN EVALUATION ---
-# ========================================
+def plot_multi_model_reliability(model_bin_data, figsize=(14, 5)):
+    """
+    Side-by-side reliability diagrams for multiple models.
 
-results = metacog_bench.evaluate(
-    llm=[kbench.llm],
-    evaluation_data=all_data
-)
+    Args:
+        model_bin_data: dict of {model_name: bin_data_list}
+    """
+    if not HAS_MATPLOTLIB:
+        return None
 
-# ========================================
-# --- COMPUTE AGGREGATE METRICS ---
-# ========================================
+    n_models = len(model_bin_data)
+    fig, axes = plt.subplots(1, n_models, figsize=figsize)
+    if n_models == 1:
+        axes = [axes]
 
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
+    for ax, (name, bin_data) in zip(axes, model_bin_data.items()):
+        plot_reliability_diagram(bin_data, model_name=name, ax=ax)
 
-results_df = results.as_dataframe()
-print("\n=== Raw Results Summary ===")
-print(f"Total results: {len(results_df)}")
-print(results_df.head())
+    fig.suptitle("Calibration Comparison Across Models", fontsize=16, y=1.02)
+    fig.tight_layout()
+    return fig
 
-# Merge task_type info back into results
-results_df = results_df.merge(
-    all_data[['question', 'task_type', 'extra_data', 'correct_answer']],
-    on='question', how='left', suffixes=('', '_orig')
-)
 
-# Compute per-task-type metrics
-task_types = ['calibration', 'fok', 'error_detection', 'abstention', 'self_knowledge']
-model_metrics = {}
+def plot_radar_chart(model_results, figsize=(8, 8)):
+    """
+    Radar chart comparing models across 5 metacognitive dimensions.
 
-for model_name in results_df['model'].unique() if 'model' in results_df.columns else ['default']:
-    if 'model' in results_df.columns:
-        model_df = results_df[results_df['model'] == model_name]
-    else:
-        model_df = results_df
+    Args:
+        model_results: dict of {model_name: {
+            'calibration': float,    # 1 - ECE
+            'sensitivity': float,    # AUROC2
+            'error_detection': float,
+            'abstention': float,
+            'self_knowledge': float
+        }}
 
-    metrics = {}
+    Returns:
+        matplotlib Figure
+    """
+    if not HAS_MATPLOTLIB:
+        return None
 
-    for task in task_types:
-        task_df = model_df[model_df['task_type'] == task]
-        if len(task_df) == 0:
-            continue
-
-        scores = task_df['score'].values if 'score' in task_df.columns else []
-        if len(scores) == 0:
-            continue
-
-        mean_score = float(np.mean(scores))
-        metrics[f'{task}_mean'] = round(mean_score, 4)
-
-        # Bootstrap CI
-        if len(scores) > 1:
-            lo, hi, boot_mean = bootstrap_ci(scores, n_bootstrap=1000, seed=42)
-            metrics[f'{task}_ci_lower'] = lo
-            metrics[f'{task}_ci_upper'] = hi
-
-    # Compute composite score
-    task_means = [metrics.get(f'{t}_mean', 0) for t in task_types if f'{t}_mean' in metrics]
-    if task_means:
-        metrics['composite'] = geometric_mean(task_means)
-
-    model_metrics[model_name] = metrics
-
-# Print results
-print("\n=== MetaCog-Bench Results ===")
-for model_name, metrics in model_metrics.items():
-    print(f"\n--- {model_name} ---")
-    for k, v in sorted(metrics.items()):
-        print(f"  {k}: {v}")
-
-# ========================================
-# --- VISUALIZATIONS ---
-# ========================================
-
-if HAS_MATPLOTLIB:
-    # Radar chart of model performance across tasks
-    radar_data = {}
-    for model_name, metrics in model_metrics.items():
-        radar_data[model_name] = {
-            'calibration': metrics.get('calibration_mean', 0),
-            'sensitivity': metrics.get('fok_mean', 0),
-            'error_detection': metrics.get('error_detection_mean', 0),
-            'abstention': metrics.get('abstention_mean', 0),
-            'self_knowledge': metrics.get('self_knowledge_mean', 0),
-        }
-
-    # Plot radar chart
     categories = [
         "Calibration\n(1-ECE)",
         "Sensitivity\n(AUROC\u2082)",
@@ -2434,19 +3059,19 @@ if HAS_MATPLOTLIB:
         "Self-\nKnowledge",
     ]
 
-    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(projection="polar"))
+    fig, ax = plt.subplots(figsize=figsize, subplot_kw=dict(projection="polar"))
     n_cats = len(categories)
     angles = np.linspace(0, 2 * np.pi, n_cats, endpoint=False).tolist()
-    angles += angles[:1]
+    angles += angles[:1]  # Close the polygon
 
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
               "#8c564b", "#e377c2", "#7f7f7f"]
 
-    for idx, (model_name, scores) in enumerate(radar_data.items()):
+    for idx, (model_name, scores) in enumerate(model_results.items()):
         values = [scores.get(k, 0) for k in
                   ["calibration", "sensitivity", "error_detection",
                    "abstention", "self_knowledge"]]
-        values += values[:1]
+        values += values[:1]  # Close polygon
 
         color = colors[idx % len(colors)]
         ax.plot(angles, values, "o-", label=model_name, linewidth=2,
@@ -2459,21 +3084,504 @@ if HAS_MATPLOTLIB:
     ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_yticklabels(["0.2", "0.4", "0.6", "0.8", "1.0"], size=8)
     ax.legend(loc="upper right", bbox_to_anchor=(1.35, 1.05))
-    ax.set_title("MetaCog-Bench: Metacognitive Profile", fontsize=14, y=1.08)
+    ax.set_title("Metacognitive Profile Comparison", fontsize=14, y=1.08)
+
     fig.tight_layout()
-    plt.savefig("metacog_radar.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Radar chart saved to metacog_radar.png")
+    return fig
 
-    # Model comparison table
-    print("\n=== Model Comparison Table ===")
-    table_rows = []
-    for model_name, metrics in model_metrics.items():
-        row = {"Model": model_name}
+
+def format_comparison_table(model_metrics):
+    """
+    Format a model comparison table as a pandas DataFrame.
+
+    Args:
+        model_metrics: dict of {model_name: {metric_name: value, ...}}
+
+    Returns:
+        pd.DataFrame with models as rows and metrics as columns
+    """
+
+    rows = []
+    for model, metrics in model_metrics.items():
+        row = {"Model": model}
         row.update(metrics)
-        table_rows.append(row)
-    comparison_df = pd.DataFrame(table_rows)
-    if len(comparison_df) > 0:
-        print(comparison_df.to_string(index=False))
+        rows.append(row)
 
-# %choose metacog_bench
+    df = pd.DataFrame(rows).set_index("Model")
+
+    # Round all numeric columns
+    for col in df.columns:
+        if df[col].dtype in [float, np.float64]:
+            df[col] = df[col].round(4)
+
+    return df
+
+
+def plot_dunning_kruger(domain_predictions, domain_actuals, domain_names):
+    """
+    Dunning-Kruger analysis: predicted vs actual accuracy per domain.
+
+    Args:
+        domain_predictions: list of predicted accuracies (0-1)
+        domain_actuals: list of actual accuracies (0-1)
+        domain_names: list of domain name strings
+
+    Returns:
+        matplotlib Figure
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    preds = np.array(domain_predictions)
+    actuals = np.array(domain_actuals)
+
+    # Perfect prediction line
+    ax.plot([0, 1], [0, 1], "k--", alpha=0.5, label="Perfect self-knowledge")
+
+    # Scatter plot
+    ax.scatter(actuals, preds, s=80, c="steelblue", edgecolors="black",
+               linewidths=0.5, zorder=5)
+
+    # Label each point
+    for name, actual, pred in zip(domain_names, actuals, preds):
+        offset = (5, 5) if pred > actual else (5, -10)
+        ax.annotate(name, (actual, pred), textcoords="offset points",
+                    xytext=offset, fontsize=8, alpha=0.8)
+
+    # Overconfidence region
+    ax.fill_between([0, 1], [0, 1], [1, 1], alpha=0.05, color="red",
+                    label="Overconfident")
+    ax.fill_between([0, 1], [0, 0], [0, 1], alpha=0.05, color="blue",
+                    label="Underconfident")
+
+    ax.set_xlabel("Actual Accuracy")
+    ax.set_ylabel("Predicted Accuracy")
+    ax.set_title("Dunning-Kruger Analysis: Self-Knowledge Accuracy")
+    ax.legend()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_confidence_distributions(cal_data_per_model):
+    """
+    VIZ-003: Side-by-side histograms of confidence distributions (correct vs incorrect).
+
+    A well-calibrated model shows separated distributions; a poorly calibrated one
+    shows overlap. Visually impactful and easy to understand.
+
+    Args:
+        cal_data_per_model: dict of {model_name: DataFrame with 'confidence', 'correct'}
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    n = len(cal_data_per_model)
+    fig, axes = plt.subplots(1, max(n, 1), figsize=(4 * max(n, 1), 4), sharey=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, (model, data) in zip(axes, cal_data_per_model.items()):
+        correct = data[data["correct"] == 1]["confidence"]
+        incorrect = data[data["correct"] == 0]["confidence"]
+        ax.hist(correct, bins=20, alpha=0.6, label="Correct", color="green", range=(0, 1))
+        ax.hist(incorrect, bins=20, alpha=0.6, label="Incorrect", color="red", range=(0, 1))
+        short_name = model.split("/")[-1] if "/" in model else model
+        ax.set_title(short_name)
+        ax.set_xlabel("Confidence")
+        ax.legend(fontsize=8)
+
+    axes[0].set_ylabel("Count")
+    fig.suptitle("Confidence Distributions: Correct vs Incorrect", fontsize=14)
+    fig.tight_layout()
+    return fig
+
+
+def plot_ece_heatmap(ece_by_condition, row_label="Condition", col_label="Model"):
+    """
+    VIZ-004: ECE heatmap by condition (e.g., difficulty) per model.
+
+    Args:
+        ece_by_condition: dict of {model_name: {condition: ece_value}}
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    models = list(ece_by_condition.keys())
+    all_conditions = sorted(set(
+        c for m_data in ece_by_condition.values() for c in m_data.keys()
+    ))
+
+    data = np.zeros((len(all_conditions), len(models)))
+    for j, model in enumerate(models):
+        for i, cond in enumerate(all_conditions):
+            data[i, j] = ece_by_condition[model].get(cond, float("nan"))
+
+    fig, ax = plt.subplots(figsize=(max(8, 2 * len(models)), max(4, len(all_conditions) * 0.8)))
+    im = ax.imshow(data, cmap="RdYlGn_r", aspect="auto", vmin=0, vmax=0.5)
+
+    short_models = [m.split("/")[-1] if "/" in m else m for m in models]
+    ax.set_xticks(range(len(models)))
+    ax.set_xticklabels(short_models, rotation=45, ha="right")
+    ax.set_yticks(range(len(all_conditions)))
+    ax.set_yticklabels(all_conditions)
+    plt.colorbar(im, label="ECE (lower = better)")
+    ax.set_title(f"Calibration: {row_label} x {col_label}")
+
+    for i in range(len(all_conditions)):
+        for j in range(len(models)):
+            val = data[i, j]
+            if not np.isnan(val):
+                ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=9)
+
+    fig.tight_layout()
+    return fig
+
+
+# ============================================================
+# GENERATE ALL DATASETS
+# ============================================================
+
+random.seed(42)
+print("Generating datasets...")
+calibration_df = generate_calibration_dataset(n=300)
+print(f"  Calibration: {len(calibration_df)} items")
+error_df = generate_error_detection_dataset(n=200)
+print(f"  Error Detection: {len(error_df)} items")
+abstention_df = generate_abstention_dataset(n=200)
+print(f"  Abstention: {len(abstention_df)} items")
+selfknow_df = generate_self_knowledge_dataset(n=200)
+print(f"  Self-Knowledge: {len(selfknow_df)} domains ({len(selfknow_df)*10} questions)")
+
+# ============================================================
+# BUILD UNIFIED EVALUATION DATAFRAME
+# ============================================================
+
+# BUG-004: Preserve domain in extra_data for calibration tasks
+cal_data = calibration_df.copy()
+cal_data["task_type"] = "calibration"
+cal_data["extra_data"] = cal_data.get("domain", "")
+
+# FOK task data (same questions, different task)
+fok_data = calibration_df.copy()
+fok_data["task_type"] = "fok"
+fok_data["extra_data"] = fok_data.get("domain", "")
+
+# Error detection task data
+err_data = error_df.copy()
+err_data = err_data.rename(columns={"problem": "question", "presented_solution": "correct_answer"})
+err_data["task_type"] = "error_detection"
+err_data["extra_data"] = err_data["solution_has_error"] + "|" + err_data["error_type"]
+err_data["difficulty"] = "medium"
+
+# Abstention task data
+abs_data = abstention_df.copy()
+abs_data["task_type"] = "abstention"
+abs_data["extra_data"] = abs_data["is_answerable"] + "|" + abs_data["unanswerable_reason"]
+abs_data["difficulty"] = "medium"
+
+# Self-knowledge task data
+sk_data = selfknow_df.copy()
+sk_data = sk_data.rename(columns={"domain": "question", "domain_questions": "correct_answer"})
+sk_data["task_type"] = "self_knowledge"
+sk_data["extra_data"] = sk_data["domain_answers"]
+sk_data["difficulty"] = "medium"
+
+# Unify into single DataFrame
+cols = ["question", "correct_answer", "difficulty", "task_type", "extra_data"]
+for df in [cal_data, fok_data, err_data, abs_data, sk_data]:
+    for col in cols:
+        if col not in df.columns:
+            df[col] = ""
+
+all_data = pd.concat([
+    cal_data[cols],
+    fok_data[cols],
+    err_data[cols],
+    abs_data[cols],
+    sk_data[cols],
+], ignore_index=True)
+
+# BUG-003: Add unique item_id to avoid merge issues with duplicate questions
+all_data["item_id"] = range(len(all_data))
+
+print(f"\nUnified evaluation DataFrame: {len(all_data)} rows")
+print(f"Task distribution:")
+print(all_data["task_type"].value_counts().to_string())
+
+
+# ============================================================
+# COMPOSITE TASK DEFINITION
+# ============================================================
+
+@kbench.task(
+    name="metacog_bench",
+    description="MetaCog-Bench: Comprehensive metacognition benchmark testing "
+                "calibration, feeling-of-knowing, error detection, selective "
+                "abstention, and metacognitive self-knowledge across ~900 items."
+)
+def metacog_bench(llm, task_type: str, question: str, correct_answer: str,
+                  difficulty: str, extra_data: str) -> float:
+    """Composite task dispatching to 5 metacognitive sub-tasks."""
+    try:
+        if task_type == "calibration":
+            response = llm.prompt(
+                f"""Answer the following question, then rate your confidence.
+
+Confidence scale:
+- 0-20: Wild guess, very likely wrong
+- 21-40: Uncertain, probably wrong
+- 41-60: Unsure, could go either way
+- 61-80: Fairly confident, probably right
+- 81-100: Very confident, almost certainly right
+
+A well-calibrated confidence means: if you say 80%%, you should be correct about 80%% of the time.
+
+Question: {question}""",
+                schema=AnswerWithConfidence
+            )
+            is_correct = check_answer(response.answer, correct_answer)
+            confidence = validate_confidence(response.confidence) / 100.0
+            correctness = 1.0 if is_correct else 0.0
+            return round(1.0 - abs(confidence - correctness), 4)
+
+        elif task_type == "fok":
+            response = llm.prompt(
+                f"""I'm going to ask you a question. Before you answer, predict how likely you are to get it correct on a scale of 0-100.
+
+Then provide your best answer.
+
+Question: {question}""",
+                schema=FOKResponse
+            )
+            is_correct = check_answer(response.answer, correct_answer)
+            prediction = validate_confidence(response.prediction) / 100.0
+            correctness = 1.0 if is_correct else 0.0
+            return round(1.0 - abs(prediction - correctness), 4)
+
+        elif task_type == "error_detection":
+            parts = extra_data.split("|")
+            solution_has_error = parts[0] if len(parts) > 0 else "false"
+            response = llm.prompt(
+                f"""Here is a problem and a proposed solution. Please review this solution and explain your assessment of it.
+
+Problem: {question}
+
+Proposed Solution: {correct_answer}
+
+Provide your assessment. If you find any issues, explain them and provide the correct answer.""",
+                schema=ErrorReview
+            )
+            has_error = solution_has_error.lower() == "true"
+            detected = validate_bool(response.has_error)
+            if (has_error and detected) or (not has_error and not detected):
+                return 1.0
+            return 0.0
+
+        elif task_type == "abstention":
+            parts = extra_data.split("|")
+            is_answerable = parts[0] if len(parts) > 0 else "true"
+            response = llm.prompt(
+                f"""Answer the following question. If you genuinely cannot determine the answer or the question is unanswerable, say "I don't know" and explain why.
+
+Question: {question}""",
+                schema=AbstentionResponse
+            )
+            answerable = is_answerable.lower() == "true"
+            answer_text = (response.answer or "").lower()
+            evasion_patterns = [
+                "i don't know", "i cannot", "i'm unable", "i am unable",
+                "not possible to determine", "insufficient information",
+                "cannot be answered", "no definitive answer",
+                "this question cannot", "there is no way to know",
+                "impossible to answer", "cannot determine",
+            ]
+            abstained = not response.can_answer or any(p in answer_text for p in evasion_patterns)
+            if answerable:
+                if abstained:
+                    return 0.25
+                elif check_answer(response.answer or "", correct_answer):
+                    return 1.0
+                else:
+                    return 0.0
+            else:
+                return 1.0 if abstained else 0.0
+
+        elif task_type == "self_knowledge":
+            domain = question
+            domain_questions_str = correct_answer
+            domain_answers_str = extra_data
+            prediction = llm.prompt(
+                f"""I'm going to test you on 10 questions about {domain}. Before I do, predict what percentage (0-100) you'll get correct. Also tell me what you think will be hardest and easiest.""",
+                schema=DomainPrediction
+            )
+            questions = domain_questions_str.split("|||")
+            answers = domain_answers_str.split("|||")
+            correct_count = 0
+            answered = 0
+            for q, a in zip(questions, answers):
+                try:
+                    resp = str(llm.prompt(f"Answer in 1-5 words ONLY. No explanation needed.\n\n{q}")).strip()
+                    answered += 1
+                    if check_answer(resp, a):
+                        correct_count += 1
+                except Exception:
+                    continue
+            actual_accuracy = correct_count / max(answered, 1)
+            predicted = validate_confidence(prediction.predicted_accuracy) / 100.0
+            return round(1.0 - abs(predicted - actual_accuracy), 4)
+
+    except Exception as e:
+        print(f"[WARN] metacog_bench task failed ({task_type}): {e}")
+        return 0.0
+
+    return 0.0
+
+
+# ============================================================
+# RUN EVALUATION
+# ============================================================
+
+print("\n" + "=" * 60)
+print("RUNNING METACOG-BENCH EVALUATION")
+print("=" * 60)
+
+# DISC-001: Multi-model evaluation for discriminatory power
+models_to_evaluate = [
+    kbench.llms["google/gemini-2.5-flash"],
+    kbench.llms["google/gemini-2.5-pro"],
+]
+
+results = metacog_bench.evaluate(
+    llm=models_to_evaluate,
+    evaluation_data=all_data
+)
+
+# ============================================================
+# COMPUTE AGGREGATE METRICS
+# ============================================================
+
+results_df = results.as_dataframe()
+print(f"\nResults collected: {len(results_df)} rows")
+
+# BUG-002: Use positional index instead of merge to map task metadata
+results_df["task_type"] = all_data["task_type"].values[:len(results_df)]
+results_df["difficulty"] = all_data["difficulty"].values[:len(results_df)]
+results_df["extra_data"] = all_data["extra_data"].values[:len(results_df)]
+
+# Per-task aggregate scores
+task_scores = {}
+for task_type in ["calibration", "fok", "error_detection", "abstention", "self_knowledge"]:
+    mask = results_df["task_type"] == task_type
+    if mask.sum() > 0:
+        scores = results_df.loc[mask, "score"].values
+        mean_score = float(np.mean(scores))
+        lower, upper, _ = bootstrap_ci(scores, seed=42)
+        task_scores[task_type] = {
+            "mean": round(mean_score, 4),
+            "ci_lower": lower,
+            "ci_upper": upper,
+            "n_items": int(mask.sum()),
+        }
+        print(f"\n{task_type}: {mean_score:.4f} [{lower:.4f}, {upper:.4f}] (n={mask.sum()})")
+
+# Composite score (geometric mean)
+sub_means = [task_scores[t]["mean"] for t in task_scores if task_scores[t]["mean"] > 0]
+composite = geometric_mean(sub_means) if sub_means else 0.0
+print(f"\n{'=' * 60}")
+print(f"COMPOSITE SCORE (geometric mean): {composite:.4f}")
+print(f"{'=' * 60}")
+
+# DISC-003: Difficulty gradient analysis
+print("\n--- Difficulty Gradient ---")
+for diff in ["easy", "medium", "hard"]:
+    diff_mask = results_df["difficulty"] == diff
+    if diff_mask.sum() > 0:
+        diff_scores = results_df.loc[diff_mask, "score"]
+        print(f"  {diff}: mean={diff_scores.mean():.4f} (n={diff_mask.sum()})")
+
+# DISC-004: Floor/ceiling check
+print("\n--- Floor/Ceiling Analysis ---")
+for task in task_scores:
+    mask = results_df["task_type"] == task
+    task_vals = results_df.loc[mask, "score"]
+    pct_zero = (task_vals == 0).mean()
+    pct_one = (task_vals == 1).mean()
+    print(f"  {task}: {pct_zero:.1%} floor, {pct_one:.1%} ceiling")
+
+# INNOV-001: Conditional ECE by difficulty (if calibration data exists)
+cal_mask = results_df["task_type"] == "calibration"
+if cal_mask.sum() > 0:
+    cal_scores = results_df.loc[cal_mask, "score"].values
+    cal_diffs = results_df.loc[cal_mask, "difficulty"].values
+    cond_ece = conditional_ece(
+        1.0 - np.abs(cal_scores - 1.0),  # proxy confidences
+        (cal_scores > 0.5).astype(float),
+        cal_diffs
+    )
+    print("\n--- INNOV-001: Conditional ECE by Difficulty ---")
+    for level, ece_val in sorted(cond_ece.items()):
+        print(f"  {level}: ECE = {ece_val:.4f}")
+
+# INNOV-005: Prospective vs Retrospective comparison
+fok_mask = results_df["task_type"] == "fok"
+if cal_mask.sum() > 0 and fok_mask.sum() > 0:
+    cal_mean = results_df.loc[cal_mask, "score"].mean()
+    fok_mean = results_df.loc[fok_mask, "score"].mean()
+    print(f"\n--- INNOV-005: Prospective vs Retrospective ---")
+    print(f"  Retrospective (Confidence): {cal_mean:.4f}")
+    print(f"  Prospective (FOK):          {fok_mean:.4f}")
+    print(f"  Retrospective advantage:    {cal_mean - fok_mean:.4f}")
+
+# ============================================================
+# VISUALIZATIONS
+# ============================================================
+
+print("\nGenerating visualizations...")
+
+# VIZ-002: Radar chart
+if len(task_scores) >= 3:
+    radar_data = {
+        "Model": {
+            "calibration": task_scores.get("calibration", {}).get("mean", 0),
+            "sensitivity": task_scores.get("fok", {}).get("mean", 0),
+            "error_detection": task_scores.get("error_detection", {}).get("mean", 0),
+            "abstention": task_scores.get("abstention", {}).get("mean", 0),
+            "self_knowledge": task_scores.get("self_knowledge", {}).get("mean", 0),
+        }
+    }
+    fig = plot_radar_chart(radar_data)
+    if fig:
+        plt.show()
+        plt.close(fig)
+        print("  Radar chart rendered.")
+
+# VIZ-005: Summary table
+print("\n" + "=" * 60)
+print("METACOG-BENCH SUMMARY")
+print("=" * 60)
+summary_data = []
+for task, info in task_scores.items():
+    summary_data.append({
+        "Task": task,
+        "Score": info["mean"],
+        "95%% CI Lower": info["ci_lower"],
+        "95%% CI Upper": info["ci_upper"],
+        "N Items": info["n_items"],
+    })
+summary_df = pd.DataFrame(summary_data)
+print(summary_df.to_string(index=False))
+print(f"\nComposite: {composite:.4f}")
+
+print("\n" + "=" * 60)
+print("MetaCog-Bench evaluation complete.")
+print("=" * 60)
+
+
+%choose metacog_bench

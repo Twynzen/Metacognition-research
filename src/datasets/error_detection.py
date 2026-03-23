@@ -658,6 +658,70 @@ _METHOD_GENERATORS = [
     _method_base_rate_neglect,
 ]
 
+# Curated subtle method errors — these require metacognitive reasoning to detect
+_STATIC_METHOD_ERRORS = [
+    {
+        "problem": "A store offers 20% off, then an additional 15% off the reduced price. What is the total discount?",
+        "presented_solution": "Total discount = 20% + 15% = 35%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "You drive 60 miles at 30 mph, then 60 miles at 60 mph. What is your average speed for the whole trip?",
+        "presented_solution": "Average speed = (30 + 60) / 2 = 45 mph.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "A ball is thrown upward at 20 m/s. What is the maximum height reached? (Use g = 10 m/s².)",
+        "presented_solution": "Maximum height = v × t = 20 × 2 = 40 m. (Time to reach top = v/g = 20/10 = 2 s.)",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "What is the probability of getting at least one head in 3 coin flips?",
+        "presented_solution": "There are 3 flips and 6 possible outcomes. Favorable outcomes (at least one head) = 3. So probability = 3/6 = 50%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "In a room of 23 people, what is the probability that at least two people share a birthday? (Assume 365 days in a year.)",
+        "presented_solution": "There are 23 people and 365 possible birthdays. The probability is approximately 23/365 ≈ 6.3%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "A store offers 30% off, then an additional 20% off the reduced price. What is the total discount?",
+        "presented_solution": "Total discount = 30% + 20% = 50%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "You drive 100 miles at 25 mph, then 100 miles at 75 mph. What is your average speed for the whole trip?",
+        "presented_solution": "Average speed = (25 + 75) / 2 = 50 mph.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "A ball is thrown upward at 30 m/s. What is the maximum height reached? (Use g = 10 m/s².)",
+        "presented_solution": "Maximum height = v × t = 30 × 3 = 90 m. (Time to reach top = v/g = 30/10 = 3 s.)",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "What is the probability of getting at least one six in 4 rolls of a fair die?",
+        "presented_solution": "There are 4 rolls, each with a 1/6 chance of six. So the probability = 4 × (1/6) = 4/6 ≈ 66.7%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+    {
+        "problem": "In a room of 30 people, what is the probability that at least two people share a birthday? (Assume 365 days in a year.)",
+        "presented_solution": "There are 30 people and 365 possible birthdays. The probability is approximately 30/365 ≈ 8.2%.",
+        "solution_has_error": "true",
+        "error_type": "method",
+    },
+]
+
 
 # ---------------------------------------------------------------------------
 # Factual-error generators
@@ -936,7 +1000,17 @@ def generate_error_detection_dataset(n: int = 200) -> pd.DataFrame:
         items.extend(_generate_unique(rng, gen, used_problems, 1))
 
     # --- Method errors ---
-    for i in range(n_method_err):
+    # First, include curated static method errors (shuffle and pick up to available)
+    static_method_pool = list(_STATIC_METHOD_ERRORS)
+    rng.shuffle(static_method_pool)
+    n_static_method = min(len(static_method_pool), n_method_err)
+    for item in static_method_pool[:n_static_method]:
+        if item["problem"] not in used_problems:
+            used_problems.add(item["problem"])
+            items.append(item)
+    # Fill remaining method error slots with procedural generators
+    n_method_remaining = n_method_err - n_static_method
+    for i in range(n_method_remaining):
         gen = _METHOD_GENERATORS[i % len(_METHOD_GENERATORS)]
         items.extend(_generate_unique(rng, gen, used_problems, 1,
                                       inject_error=True))

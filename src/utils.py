@@ -84,3 +84,23 @@ def check_answer(model_answer: str, correct_answer: str) -> bool:
             return True
 
     return False
+
+
+def validate_confidence(value, default=50):
+    """Safely extract and clamp confidence value to 0-100."""
+    if value is None:
+        return default
+    try:
+        v = int(value)
+        return max(0, min(100, v))
+    except (ValueError, TypeError):
+        return default
+
+
+def validate_bool(value, default=False):
+    """Safely extract boolean from schema output."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('true', 'yes', '1')
+    return default

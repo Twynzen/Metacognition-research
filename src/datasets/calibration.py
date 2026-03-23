@@ -274,6 +274,22 @@ _FACTUAL_MEDIUM = [
     ("What is the speed of sound in air in m/s (approximately)?", "343"),
     ("What is the capital of Peru?", "Lima"),
     ("What is the most electronegative element?", "Fluorine"),
+    # Novel composition questions (combine known facts for contamination resistance)
+    ("What is the sum of the number of continents and the number of planets in our solar system?", "15"),  # 7+8
+    ("What is the product of the number of sides on a triangle and the number of sides on a pentagon?", "15"),  # 3*5
+    ("How many years between the signing of the Magna Carta (1215) and the French Revolution (1789)?", "574"),
+    ("What is the sum of the atomic number of Helium and the atomic number of Carbon?", "8"),  # 2+6
+    ("How many total letters are in the chemical symbols for Gold (Au) and Silver (Ag)?", "4"),
+    ("What is the sum of the number of US states and the number of Canadian provinces?", "60"),  # 50+10
+    ("How many years between Columbus reaching the Americas (1492) and the Moon landing (1969)?", "477"),
+    ("What is the product of the number of vowels in English and the number of primary colors?", "15"),  # 5*3
+    ("What is the sum of the boiling point and freezing point of water in Celsius?", "100"),  # 100+0
+    ("How many total strings are on a standard guitar and a standard violin?", "10"),  # 6+4
+    ("What is the square of the number of Harry Potter books?", "49"),  # 7^2
+    ("How many total wheels on a bicycle and a tricycle?", "5"),  # 2+3
+    ("What is the sum of the number of bones in the adult human body and the number of teeth?", "238"),  # 206+32
+    ("How many years between the end of WWI (1918) and the start of WWII (1939)?", "21"),
+    ("What is the product of the number of Great Lakes and the number of oceans?", "25"),  # 5*5
 ]
 
 _FACTUAL_HARD = [

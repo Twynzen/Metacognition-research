@@ -39,9 +39,15 @@ Question: {question}""",
     )
 
     answerable = is_answerable.lower() == "true"
-    abstained = not response.can_answer or (
-        response.answer and "i don't know" in response.answer.lower()
-    )
+    answer_text = (response.answer or "").lower()
+    evasion_patterns = [
+        "i don't know", "i cannot", "i'm unable", "i am unable",
+        "not possible to determine", "insufficient information",
+        "cannot be answered", "no definitive answer",
+        "this question cannot", "there is no way to know",
+        "impossible to answer", "cannot determine",
+    ]
+    abstained = not response.can_answer or any(p in answer_text for p in evasion_patterns)
 
     if answerable:
         if abstained:
